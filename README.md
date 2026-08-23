@@ -319,5 +319,3 @@ PEAK-DG-LAB-Integration
 7. 保存规则配置，开始正式使用。
 
 ---
-
-本指南关注“如何把项目跑起来并安全使用”。更详细的规则字段、波形协议和源码实现可继续查看 `Coyote/src/Coyote` 下的 Python 与 C# 文件。
