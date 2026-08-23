@@ -652,6 +652,10 @@ Coyote.exe
 
 或者从源码启动：
 
+cd Coyote
+
+python -m pip install -r requirements.txt
+
 python main.py
 
 第六步：启动 WebSocket 服务
