@@ -10,7 +10,7 @@
   <!-- User properties -->
   <PropertyGroup>
     <!-- Set if the default steam game install directory doesn't work. -->
-    <PEAKGameRootDir>D:\steam\steamapps\common\PEAK\</PEAKGameRootDir>
+    <!-- <PEAKGameRootDir></PEAKGameRootDir> -->
 
     <!-- Set if your BepInEx/ directory isn't in the game files. -->
     <!-- <PEAKBepInExDir></PEAKBepInExDir> -->
