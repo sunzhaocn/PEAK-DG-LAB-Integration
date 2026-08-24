@@ -1,0 +1,71 @@
+diff --git a/Coyote/src/Coyote/ui_qt.py b/Coyote/src/Coyote/ui_qt.py
+--- a/Coyote/src/Coyote/ui_qt.py
++++ b/Coyote/src/Coyote/ui_qt.py
+@@
+         self.conn = {}
+         rows = (
+-            ("peak", "PEAK"), ("peak_packet", "最近遥测"), ("scene", "场景"),
++            ("peak", "PEAK"), ("peak_packet", "最近遥测"), ("stage", "当前关卡"), ("scene", "内部地图"),
+             ("dg", "DG APP"), ("device", "郊狼设备"), ("slot", "slotId"),
+             ("ip", "本机 IP"), ("ports", "端口"), ("device_state", "设备状态"),
+         )
+@@
+         self.telemetry_stack = QStackedWidget()
+         overview_fields = [
+-            ("scene","当前场景"),("phase","阶段"),("hasCharacter","角色对象"),
++            ("stageDisplay","当前关卡"),("stageName","当前区域"),("biome","Biome"),("scene","内部地图"),
++            ("phase","阶段"),("hasCharacter","角色对象"),
+             ("hp","血量"),("stamina","体力"),("held","手持物"),("speed","速度"),
+             ("lastUse","最近使用"),("lastConsume","最近食用/消耗"),
+         ]
+@@
+         if category == 0:
+             overview = {
++                "stageDisplay": str(p.get("stageDisplay") or "-"),
++                "stageName": str(p.get("stageName") or "-"),
++                "biome": str(p.get("biome") or "-"),
+                 "scene": str(p.get("scene") or "-"),
+                 "phase": str(p.get("phase") or "-"),
+                 "hasCharacter": self.yn(p.get("hasCharacter",True)),
+@@
+         if peak_state == "in_game":
+-            peak_base = I18N.tr(
+-                "局内 / 遥测中"
+-            )
++            raw_stage = (
++                (p or {}).get(
++                    "stageDisplay"
++                )
++                or "局内 / 遥测中"
++            )
++
++            peak_base = I18N.tr_dynamic(
++                str(raw_stage)
++            )
+             peak_text = (
+                 "● "
+                 + peak_base
+@@
+         self.conn[
+             "peak_packet"
+         ].setText(
+             packet_text
+         )
++
++        stage_display = str(
++            (p or {}).get(
++                "stageDisplay"
++            )
++            or "-"
++        )
++
++        self.conn[
++            "stage"
++        ].setText(
++            I18N.tr_dynamic(
++                stage_display
++            )
++        )
+ 
+         scene = str(
+             (p or {}).get(
