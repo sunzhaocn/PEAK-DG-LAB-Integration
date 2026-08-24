@@ -542,7 +542,7 @@ def install_ui(UI) -> None:
             note.setWordWrap(True)
             pl.addWidget(note)
 
-            form = UI.QFormLayout()
+            # V2.3: 网络设置改为左右并排，而不是一个 QFormLayout 从上到下串行。
             self.net_mode = UI.QComboBox()
             for mode, label in MODE_LABELS.items():
                 self.net_mode.addItem(label, mode)
@@ -582,18 +582,45 @@ def install_ui(UI) -> None:
             self.net_current.setTextInteractionFlags(UI.Qt.TextInteractionFlag.TextSelectableByMouse)
             self.net_current.setWordWrap(True)
 
-            form.addRow("连接模式", self.net_mode)
-            form.addRow("官方通道", self.net_official)
-            form.addRow("自定义 Relay", self.net_custom)
-            form.addRow("直连地址来源", self.net_source)
-            form.addRow("手动主机/IP", self.net_manual_host)
-            form.addRow("本机 IPv4", self.net_local4)
-            form.addRow("本机 IPv6", self.net_local6)
-            form.addRow("公网 IPv4", self.net_public4)
-            form.addRow("公网 IPv6", self.net_public6)
-            form.addRow("公网直连判断", self.net_public_state)
-            form.addRow("当前控制端地址", self.net_current)
-            pl.addLayout(form)
+            # 左栏：只放“选择/配置”；右栏：只放“检测/状态”。
+            columns = UI.QHBoxLayout()
+            columns.setSpacing(12)
+
+            config_box = UI.QGroupBox("连接方式")
+            config_form = UI.QFormLayout(config_box)
+            config_form.setFieldGrowthPolicy(UI.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            config_form.setLabelAlignment(UI.Qt.AlignmentFlag.AlignRight | UI.Qt.AlignmentFlag.AlignVCenter)
+            config_form.addRow("连接模式", self.net_mode)
+
+            self.net_official_label = UI.QLabel("官方通道")
+            self.net_custom_label = UI.QLabel("自定义 Relay")
+            self.net_source_label = UI.QLabel("直连地址来源")
+            self.net_manual_label = UI.QLabel("手动主机/IP")
+
+            config_form.addRow(self.net_official_label, self.net_official)
+            config_form.addRow(self.net_custom_label, self.net_custom)
+            config_form.addRow(self.net_source_label, self.net_source)
+            config_form.addRow(self.net_manual_label, self.net_manual_host)
+
+            status_box = UI.QGroupBox("网络检测 / 当前状态")
+            status_form = UI.QFormLayout(status_box)
+            status_form.setFieldGrowthPolicy(UI.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            status_form.setLabelAlignment(UI.Qt.AlignmentFlag.AlignRight | UI.Qt.AlignmentFlag.AlignVCenter)
+            status_form.addRow("本机 IPv4", self.net_local4)
+            status_form.addRow("本机 IPv6", self.net_local6)
+            status_form.addRow("公网 IPv4", self.net_public4)
+            status_form.addRow("公网 IPv6", self.net_public6)
+            status_form.addRow("公网直连判断", self.net_public_state)
+            status_form.addRow("当前控制端地址", self.net_current)
+
+            columns.addWidget(config_box, 1)
+            columns.addWidget(status_box, 1)
+            pl.addLayout(columns)
+
+            # 选择模式时即时隐藏无关输入，避免“所有模式控件一起串着显示”。
+            self.net_mode.currentIndexChanged.connect(self._network_update_mode_fields)
+            self.net_source.currentIndexChanged.connect(self._network_update_mode_fields)
+            self._network_update_mode_fields()
 
             buttons = UI.QHBoxLayout()
             detect = UI.QPushButton("重新自动检测")
@@ -614,6 +641,25 @@ def install_ui(UI) -> None:
             outer.addWidget(panel)
             self._network_last_ui_refresh = 0.0
             detect_network_async(force=False)
+
+        def _network_update_mode_fields(self, *args):
+            mode = self.net_mode.currentData() or MODE_LAN
+            source = self.net_source.currentData() or "auto"
+
+            is_official = mode == MODE_OFFICIAL
+            is_custom = mode == MODE_CUSTOM
+            is_direct = mode in (MODE_LAN, MODE_VIRTUAL, MODE_PUBLIC)
+
+            for widget in (self.net_official_label, self.net_official):
+                widget.setVisible(is_official)
+            for widget in (self.net_custom_label, self.net_custom):
+                widget.setVisible(is_custom)
+            for widget in (self.net_source_label, self.net_source):
+                widget.setVisible(is_direct)
+
+            show_manual = is_direct and source == "manual"
+            for widget in (self.net_manual_label, self.net_manual_host):
+                widget.setVisible(show_manual)
 
         def _network_collect(self):
             mode = self.net_mode.currentData() or MODE_LAN
