@@ -70,6 +70,8 @@ $Required = @(
     "src\Coyote\i18n.py",
     "src\Coyote\extended_features.py",
     "src\Coyote\multiplayer_features.py",
+    "src\Coyote\app_version.py",
+    "src\Coyote\update_checker.py",
     "src\Coyote\MultiplayerTelemetry.cs",
     "src\Coyote\Coyote.csproj",
     "src\Coyote\language",
@@ -107,7 +109,8 @@ Invoke-Native $Python "-m" "pip" "install" "PySide6" "Pillow" "qrcode" "websocke
 Write-Host "[3.5/9] Running source smoke checks..." -ForegroundColor Yellow
 $PythonSources = @(
     "src\Coyote\main.py", "src\Coyote\backend.py", "src\Coyote\ui_qt.py",
-    "src\Coyote\i18n.py", "src\Coyote\extended_features.py", "src\Coyote\multiplayer_features.py"
+    "src\Coyote\i18n.py", "src\Coyote\extended_features.py", "src\Coyote\multiplayer_features.py",
+    "src\Coyote\app_version.py", "src\Coyote\update_checker.py"
 )
 foreach ($RelativePath in $PythonSources) {
     Invoke-Native $Python "-m" "py_compile" (Join-Path $Root $RelativePath)
