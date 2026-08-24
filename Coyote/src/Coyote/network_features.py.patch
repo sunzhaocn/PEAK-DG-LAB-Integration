@@ -1,0 +1,58 @@
+diff --git a/Coyote/src/Coyote/network_features.py b/Coyote/src/Coyote/network_features.py
+--- a/Coyote/src/Coyote/network_features.py
++++ b/Coyote/src/Coyote/network_features.py
+@@
+-            with B.dg_lock:
+-                server_state = _s(B.dg.get("server", "")) or "-"
+-                controller_id = _s(B.dg.get("controller_id", ""))
++            with B.dg_lock:
++                server_state = _s(B.dg.get("server", ""))
++                controller_id = _s(B.dg.get("controller_id", ""))
+             if selected != applied:
+                 self.net_info["state"].setText(
+                     f"未应用（当前实际：{MODE_LABELS.get(applied, applied)}）"
+                 )
+             else:
+-                suffix = " · 已取得控制方 ID" if controller_id else ""
+-                self.net_info["state"].setText(server_state + suffix)
++                # “连接状态”首先显示当前已经应用的网络通道。
++                # 设备尚未扫码时，B.dg.server 往往只是“等待连接中”，
++                # 旧 UI 因此让用户误以为还没有应用任何网络模式。
++                #
++                # Direct 本来就是默认模式；这里明确显示：
++                #   已应用：直连 · 等待 DG-LAB APP 接入
++                #
++                # 真正接入后继续附加实际 Relay/控制方状态。
++                mode_text = (
++                    MODE_LABELS.get(
++                        applied,
++                        applied,
++                    )
++                )
++
++                waiting_states = {
++                    "",
++                    "-",
++                    "等待连接",
++                    "等待连接中",
++                    "等待 DG-LAB APP",
++                    "等待 DG-LAB APP 接入",
++                }
++
++                if controller_id:
++                    detail = (
++                        " · 已取得控制方 ID"
++                    )
++                elif server_state in waiting_states:
++                    detail = (
++                        " · 等待 DG-LAB APP 接入"
++                    )
++                else:
++                    detail = (
++                        " · "
++                        + server_state
++                    )
++
++                self.net_info["state"].setText(
++                    f"已应用：{mode_text}{detail}"
++                )
