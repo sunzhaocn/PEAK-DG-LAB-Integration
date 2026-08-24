@@ -1,4 +1,4 @@
-"""Coyote network / relay extension - V2.6.
+"""Coyote network / relay extension - V2.6.1.
 
 The UI and networking model intentionally expose only three top-level modes:
 
@@ -11,13 +11,13 @@ The UI and networking model intentionally expose only three top-level modes:
 2. Official WSS relay
    - fixed release endpoint from official_relay.json / relay_config.py.
 3. Custom relay
-   - user supplied ws:// or wss:// endpoint.
+   - user supplied wss:// endpoint (public/custom relay is encrypted).
 
 There is no automatic fallback from Direct to the official relay. Public relay
 traffic is entered only after the user explicitly selects and applies a relay
 mode.
 
-V2.4 provides the inline live-latency panel. V2.6 adds encrypted relay observability, stable client identity, client-log upload, and server kick/block reason handling. Latency checks use TCP/TLS
+V2.6.1 keeps the inline live-latency panel and requires WSS for public/custom relays. Latency checks use TCP/TLS
 connection setup in a worker thread instead of creating temporary DG-LAB
 controller WebSocket sessions, so periodic monitoring does not pollute the
 relay's controller count.
@@ -26,14 +26,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import os
-import platform
 import socket
 import ssl
 import threading
 import time
-import uuid
-from collections import deque
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -46,15 +42,6 @@ _BACKEND_INSTALLED = False
 _UI_INSTALLED = False
 _ORIGINAL_LOAD_CONFIG = None
 _ORIGINAL_SAVE_CONFIG = None
-_ORIGINAL_ON_MESSAGE = None
-_ORIGINAL_ON_OPEN = None
-_ORIGINAL_ON_CLOSE = None
-_ORIGINAL_ON_ERROR = None
-_ORIGINAL_ADD_LOG = None
-_OBSERVABILITY_STARTED = False
-_LOG_QUEUE = deque(maxlen=2000)
-_CONTROL_LOCK = threading.RLock()
-_SERVER_CONTROL = {"action":"", "reason":"", "retry_at":0.0, "updated_at":0.0}
 
 MODE_DIRECT = "direct"
 MODE_OFFICIAL = "official_relay"
@@ -91,10 +78,6 @@ NETWORK_DEFAULTS = {
     "manual_host": "",
     "direct_port": 9998,
     "direct_host_source": HOST_AUTO,
-    "client_instance_id": "",
-    "client_label": "",
-    "server_observability_enabled": True,
-    "telemetry_interval": 1.0,
 }
 
 _DETECT_LOCK = threading.RLock()
@@ -139,7 +122,7 @@ def normalize_relay_url(value) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"地址格式错误：{exc}"
     if parts.scheme.lower() != "wss":
-        return False, "远程中继必须使用 wss:// TLS 加密，禁止明文 ws://"
+        return False, "公网/自定义中继必须使用 wss://；局域网、虚拟组网或手动 IP 请使用“直连”模式"
     if not parts.hostname:
         return False, "中继地址缺少主机名/IP"
     if parts.username or parts.password:
@@ -176,7 +159,8 @@ def official_name_url() -> tuple[str, str]:
     ok, url_or_error = normalize_relay_url(raw)
     if ok:
         return name, url_or_error
-    return name, _s(raw)
+    # Official mode must fail closed to the compiled WSS endpoint, never to plaintext WS.
+    return "北京官方中继", "wss://peak.hbsuzh.cn"
 
 
 def _clean_host_input(value: str) -> str:
@@ -260,7 +244,7 @@ def active_controller_url() -> str:
         raw = _s(B.network_settings.get("custom_relay_url", ""))
         ok, value = normalize_relay_url(raw)
         # Do not silently fall back to the official endpoint.
-        return value if ok else (raw or "ws://127.0.0.1:0")
+        return value if ok else "wss://127.0.0.1:1"
     return f"ws://127.0.0.1:{int(B.DG_PORT)}"
 
 
@@ -423,144 +407,6 @@ def measure_direct_latency(timeout: float = 2.0) -> tuple[bool, float, str]:
             pass
 
 
-
-def _client_instance_id() -> str:
-    value = _s(B.network_settings.get("client_instance_id", ""))
-    if not value:
-        value = uuid.uuid4().hex
-        B.network_settings["client_instance_id"] = value
-    return value
-
-
-def _client_label() -> str:
-    label = _s(B.network_settings.get("client_label", ""))
-    return label or f"Coyote-{_client_instance_id()[:8]}"
-
-
-def _telemetry_interval() -> float:
-    try:
-        return max(0.5, min(10.0, float(B.network_settings.get("telemetry_interval", 1.0))))
-    except Exception:
-        return 1.0
-
-
-def server_control_snapshot() -> dict:
-    with _CONTROL_LOCK:
-        return dict(_SERVER_CONTROL)
-
-
-def _send_server_frame(payload: dict) -> bool:
-    if _mode() not in {MODE_OFFICIAL, MODE_CUSTOM}:
-        return False
-    with B.dg_lock:
-        ws = B.dg_ws
-    if ws is None:
-        return False
-    try:
-        packet = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        with B.ws_send_lock:
-            ws.send(packet)
-        return True
-    except Exception:
-        return False
-
-
-def _send_profile_frame() -> None:
-    if _mode() not in {MODE_OFFICIAL, MODE_CUSTOM}:
-        return
-    _send_server_frame({
-        "type": "coyote.profile",
-        "instanceId": _client_instance_id(),
-        "label": _client_label(),
-        "appVersion": _s(getattr(B, "APP_VERSION", getattr(B, "VERSION", ""))),
-        "platform": platform.platform()[:120],
-    })
-
-
-def _safe_snapshot() -> tuple[dict, dict, dict]:
-    telemetry = {}
-    try:
-        with B.peak_lock:
-            telemetry = json.loads(json.dumps(B.latest_peak, ensure_ascii=False)) if isinstance(B.latest_peak, dict) else {}
-    except Exception:
-        telemetry = {}
-    try:
-        with B.dg_lock:
-            dg = json.loads(json.dumps(B.dg, ensure_ascii=False)) if isinstance(B.dg, dict) else {}
-    except Exception:
-        dg = {}
-    multiplayer = {}
-    try:
-        import multiplayer_features as MP
-        if hasattr(MP, "get_multiplayer_snapshot"):
-            multiplayer["players"] = MP.get_multiplayer_snapshot()
-        if hasattr(MP, "get_multidevice_snapshot"):
-            multiplayer["devices"] = MP.get_multidevice_snapshot()
-    except Exception:
-        pass
-    return telemetry, dg, multiplayer
-
-
-def _flush_client_logs() -> None:
-    if not bool(B.network_settings.get("server_observability_enabled", True)):
-        return
-    batch = []
-    while _LOG_QUEUE and len(batch) < 100:
-        try:
-            batch.append(_LOG_QUEUE.popleft())
-        except IndexError:
-            break
-    if batch:
-        if not _send_server_frame({"type":"coyote.logs", "instanceId":_client_instance_id(), "entries":batch}):
-            for item in reversed(batch):
-                if len(_LOG_QUEUE) < _LOG_QUEUE.maxlen:
-                    _LOG_QUEUE.appendleft(item)
-
-
-def _observability_loop() -> None:
-    next_status = 0.0
-    while not B.stop_event.is_set():
-        if _mode() in {MODE_OFFICIAL, MODE_CUSTOM} and bool(B.network_settings.get("server_observability_enabled", True)):
-            now = time.time()
-            if now >= next_status:
-                telemetry, dg, multiplayer = _safe_snapshot()
-                _send_server_frame({
-                    "type":"coyote.status",
-                    "instanceId":_client_instance_id(),
-                    "label":_client_label(),
-                    "appVersion":_s(getattr(B, "APP_VERSION", getattr(B, "VERSION", ""))),
-                    "platform":platform.platform()[:120],
-                    "telemetry":telemetry,
-                    "dg":dg,
-                    "multiplayer":multiplayer,
-                    "network":{"mode":_mode(), "relay":active_controller_url()},
-                })
-                next_status = now + _telemetry_interval()
-            _flush_client_logs()
-        time.sleep(0.25)
-
-
-def _handle_server_control(data: dict) -> None:
-    action = _s(data.get("action", ""))
-    reason = _s(data.get("reason", "")) or ("服务器已封禁此客户端" if action == "blocked" else "管理员已踢下线")
-    try:
-        retry_after = max(5, min(86400, int(data.get("retryAfter", 60))))
-    except Exception:
-        retry_after = 60
-    if action not in {"blocked", "kicked", "notice"}:
-        return
-    with _CONTROL_LOCK:
-        _SERVER_CONTROL.update({"action":action, "reason":reason, "retry_at":time.time()+retry_after if action in {"blocked","kicked"} else 0.0, "updated_at":time.time()})
-    with B.dg_lock:
-        B.dg["server"] = "已被服务器封禁" if action == "blocked" else ("管理员已踢下线" if action == "kicked" else "服务器通知")
-        B.dg["error"] = reason
-    try:
-        if B.dg_ws is not None and action in {"blocked","kicked"}:
-            B.dg_ws.close()
-    except Exception:
-        pass
-
-
 def _persist_network_only() -> tuple[bool, str]:
     data = _json_read(B.CONFIG_FILE) if B.CONFIG_FILE.exists() else {}
     network = data.get("network")
@@ -575,10 +421,6 @@ def _persist_network_only() -> tuple[bool, str]:
         "manual_host": _s(B.network_settings.get("manual_host", "")),
         "direct_port": _direct_port(),
         "direct_host_source": _host_source(),
-        "client_instance_id": _client_instance_id(),
-        "client_label": _client_label(),
-        "server_observability_enabled": bool(B.network_settings.get("server_observability_enabled", True)),
-        "telemetry_interval": _telemetry_interval(),
     })
     data["network"] = network
     return _json_write(B.CONFIG_FILE, data)
@@ -613,20 +455,25 @@ def _load_network_extension() -> None:
         # LAN remains automatic.
         source = HOST_MANUAL if raw_mode in {"manual_direct", "virtual_lan", "public_direct"} else HOST_AUTO
     B.network_settings["direct_host_source"] = source
-    instance_id = _s(network.get("client_instance_id", ""))
-    if not instance_id:
-        instance_id = uuid.uuid4().hex
-    B.network_settings["client_instance_id"] = instance_id
-    B.network_settings["client_label"] = _s(network.get("client_label", ""))
-    B.network_settings["server_observability_enabled"] = bool(network.get("server_observability_enabled", True))
-    try:
-        interval = float(network.get("telemetry_interval", 1.0))
-    except Exception:
-        interval = 1.0
-    B.network_settings["telemetry_interval"] = max(0.5, min(10.0, interval))
+
+
+def _current_relay_blocked() -> bool:
+    checker = getattr(B, "remote_relay_is_current_blocked", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    # Compatibility fallback for older remote_reporting modules.  Never apply a
+    # remembered relay ban to Direct mode.
+    return _mode() not in LOCAL_SERVER_MODES and bool(getattr(B, "remote_relay_blocked", False))
 
 
 def request_reconnect(reason="网络设置已更改") -> None:
+    # Do NOT clear remembered relay bans just because the user switches mode.
+    # A ban belongs to one relay origin and must not leak into Direct mode or a
+    # different custom relay.  If the current remote relay was unblocked, ask
+    # the HTTPS status endpoint immediately instead of waiting for a countdown.
     try:
         ws = B.dg_ws
         if ws is not None:
@@ -637,6 +484,12 @@ def request_reconnect(reason="网络设置已更改") -> None:
         B.dg["server"] = "正在重连"
         B.dg["error"] = ""
     try:
+        check_fn = getattr(B, "check_remote_relay_block_status", None)
+        if _mode() not in LOCAL_SERVER_MODES and callable(check_fn):
+            check_fn(force=True)
+    except Exception:
+        pass
+    try:
         B.add_log("连接", "切换连接通道", f"{reason}; {active_controller_url()}")
     except Exception:
         pass
@@ -644,21 +497,22 @@ def request_reconnect(reason="网络设置已更改") -> None:
 
 def _network_websocket_loop() -> None:
     while not B.stop_event.is_set():
-        with _CONTROL_LOCK:
-            retry_at = float(_SERVER_CONTROL.get("retry_at", 0.0) or 0.0)
-            reason = _s(_SERVER_CONTROL.get("reason", ""))
-            action = _s(_SERVER_CONTROL.get("action", ""))
-        now = time.time()
-        if retry_at > now:
-            remaining = max(1, int(retry_at - now))
-            with B.dg_lock:
-                B.dg["server"] = ("已被服务器封禁" if action == "blocked" else "管理员已踢下线") + f" · {remaining}s 后重试"
-                B.dg["error"] = reason
-            time.sleep(min(1.0, retry_at - now))
-            continue
         mode = _mode()
         url = active_controller_url()
         B.DG_URL = url
+
+        # A confirmed server-side IP block should not cause a one-second
+        # reconnect storm.  remote_reporting periodically checks /relay-status
+        # over HTTPS and clears this state automatically after an unban.
+        if mode not in LOCAL_SERVER_MODES and _current_relay_blocked():
+            with B.dg_lock:
+                B.dg["server"] = "已被中继封禁"
+                B.dg["error"] = str(getattr(B, "remote_relay_block_reason", "") or "服务器拒绝连接")
+            # No reconnect attempt is made while blocked; a short sleep only
+            # keeps this loop responsive when the HTTPS long-poll reports an
+            # administrator unban.
+            time.sleep(0.25)
+            continue
 
         if mode in LOCAL_SERVER_MODES:
             if not B.server_running():
@@ -693,7 +547,7 @@ def _network_websocket_loop() -> None:
 
 
 def install_backend() -> None:
-    global _BACKEND_INSTALLED, _ORIGINAL_LOAD_CONFIG, _ORIGINAL_SAVE_CONFIG, _ORIGINAL_ON_MESSAGE, _ORIGINAL_ON_OPEN, _ORIGINAL_ON_CLOSE, _ORIGINAL_ON_ERROR, _ORIGINAL_ADD_LOG, _OBSERVABILITY_STARTED
+    global _BACKEND_INSTALLED, _ORIGINAL_LOAD_CONFIG, _ORIGINAL_SAVE_CONFIG
     if _BACKEND_INSTALLED:
         return
     _BACKEND_INSTALLED = True
@@ -703,54 +557,6 @@ def install_backend() -> None:
 
     _ORIGINAL_LOAD_CONFIG = B.load_config
     _ORIGINAL_SAVE_CONFIG = getattr(B, "save_config", None)
-    _ORIGINAL_ON_MESSAGE = B.on_message
-    _ORIGINAL_ON_OPEN = B.on_open
-    _ORIGINAL_ON_CLOSE = B.on_close
-    _ORIGINAL_ON_ERROR = B.on_error
-    _ORIGINAL_ADD_LOG = B.add_log
-
-    def add_log_wrapper(category, event, detail="", output=None):
-        result = _ORIGINAL_ADD_LOG(category, event, detail, output)
-        try:
-            _LOG_QUEUE.append({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "category": str(category)[:80], "event": str(event)[:160], "detail": str(detail)[:1000]})
-        except Exception:
-            pass
-        return result
-    B.add_log = add_log_wrapper
-
-    def on_open_wrapper(ws):
-        _ORIGINAL_ON_OPEN(ws)
-        _send_profile_frame()
-
-    def on_message_wrapper(ws, message):
-        try:
-            data = json.loads(message)
-        except Exception:
-            data = None
-        if isinstance(data, dict) and data.get("type") == "coyote.control":
-            _handle_server_control(data)
-            return
-        _ORIGINAL_ON_MESSAGE(ws, message)
-
-    def on_close_wrapper(ws, code, reason):
-        _ORIGINAL_ON_CLOSE(ws, code, reason)
-        snap = server_control_snapshot()
-        if snap.get("reason"):
-            with B.dg_lock:
-                B.dg["server"] = "已被服务器封禁" if snap.get("action") == "blocked" else "管理员已踢下线"
-                B.dg["error"] = snap.get("reason")
-
-    def on_error_wrapper(ws, error):
-        _ORIGINAL_ON_ERROR(ws, error)
-        snap = server_control_snapshot()
-        if snap.get("reason"):
-            with B.dg_lock:
-                B.dg["error"] = snap.get("reason")
-
-    B.on_open = on_open_wrapper
-    B.on_message = on_message_wrapper
-    B.on_close = on_close_wrapper
-    B.on_error = on_error_wrapper
 
     def load_config_wrapper():
         result = _ORIGINAL_LOAD_CONFIG()
@@ -775,9 +581,6 @@ def install_backend() -> None:
     B.request_network_reconnect = request_reconnect
 
     _load_network_extension()
-    if not _OBSERVABILITY_STARTED:
-        _OBSERVABILITY_STARTED = True
-        threading.Thread(target=_observability_loop, name="CoyoteRelayObservability", daemon=True).start()
     detect_network_async(force=True)
 
 
@@ -978,7 +781,7 @@ def install_ui(UI) -> None:
             custom_form.addRow("Relay 地址", self.net_custom)
             custom_l.addLayout(custom_form)
             custom_l.addWidget(self._note(
-                "填写用户自己搭建的 wss:// Relay。远程中继强制 TLS 加密，不允许明文 ws://。保存自定义地址不会改变官方服务器地址。"
+                "填写用户自己搭建的 wss:// Relay。公网中继不允许明文 ws://；局域网/虚拟组网请使用“直连”。"
             ))
             custom_l.addStretch(1)
             self.net_tabs.addTab(custom_tab, "自定义中继")
@@ -1000,7 +803,6 @@ def install_ui(UI) -> None:
                 ("ipv4", "本机 IPv4"),
                 ("ipv6", "本机 IPv6"),
                 ("state", "连接状态"),
-                ("server_notice", "服务器通知"),
             ):
                 value = self._readonly_value("-")
                 self.net_info[key] = value
@@ -1009,11 +811,6 @@ def install_ui(UI) -> None:
             columns.addWidget(self.net_tabs, 3)
             columns.addWidget(info_box, 2)
             net_l.addLayout(columns)
-
-            self.net_observability = UI.QCheckBox("向远程中继上报 PEAK 游戏状态、全部郊狼设备信息和客户端日志（仅通过 WSS/TLS 加密）")
-            self.net_observability.setChecked(bool(B.network_settings.get("server_observability_enabled", True)))
-            self.net_observability.toggled.connect(lambda checked: B.network_settings.__setitem__("server_observability_enabled", bool(checked)))
-            net_l.addWidget(self.net_observability)
 
             # Inline real-time latency. No QMessageBox / toast is used for tests.
             latency_box = UI.QGroupBox("实时延迟")
@@ -1328,14 +1125,6 @@ def install_ui(UI) -> None:
                 suffix = " · 已取得控制方 ID" if controller_id else ""
                 self.net_info["state"].setText(server_state + suffix)
 
-            notice = server_control_snapshot()
-            if notice.get("reason"):
-                retry = max(0, int(float(notice.get("retry_at",0) or 0) - time.time()))
-                suffix = f" · {retry}s 后重试" if retry > 0 else ""
-                self.net_info["server_notice"].setText(("封禁：" if notice.get("action") == "blocked" else "踢下线：") + str(notice.get("reason")) + suffix)
-            else:
-                self.net_info["server_notice"].setText("无")
-
             name, url = official_name_url()
             self.net_official_name.setText(name)
             self.net_official_url.setText(url)
@@ -1353,10 +1142,6 @@ def install_ui(UI) -> None:
                 "manual_host": _s(B.network_settings.get("manual_host", "")),
                 "direct_port": _direct_port(),
                 "direct_host_source": _host_source(),
-                "client_instance_id": _client_instance_id(),
-                "client_label": _client_label(),
-                "server_observability_enabled": bool(B.network_settings.get("server_observability_enabled", True)),
-                "telemetry_interval": _telemetry_interval(),
             })
             return payload
 
