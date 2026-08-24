@@ -507,56 +507,31 @@ public partial class Plugin
             .ToString(CultureInfo.InvariantCulture);
     }
 
+    // COYOTE_MULTIPLAYER_HARDENING_V6
     private string 多人_读取网络标识(
         Character 玩家
     )
     {
-        string[] directNames = new string[]
+        string[] stableDirectNames = new string[]
         {
-            "steamId",
-            "SteamId",
-            "steamID",
-            "SteamID",
-            "playerId",
-            "PlayerId",
-            "playerID",
-            "PlayerID",
-            "networkId",
-            "NetworkId",
-            "networkID",
-            "NetworkID",
-            "ownerId",
-            "OwnerId",
-            "ownerID",
-            "OwnerID",
-            "viewID",
-            "ViewID"
+            "steamId", "SteamId", "steamID", "SteamID",
+            "userId", "UserId", "userID", "UserID",
+            "playerId", "PlayerId", "playerID", "PlayerID",
+            "networkId", "NetworkId", "networkID", "NetworkID"
         };
 
-        object?[] targets = new object?[]
-        {
-            玩家,
-            玩家.data,
-            玩家.refs
-        };
-
+        object?[] targets = new object?[] { 玩家, 玩家.data, 玩家.refs };
         foreach (object? target in targets)
         {
-            if (target == null)
-                continue;
-
-            foreach (string name in directNames)
+            if (target == null) continue;
+            foreach (string name in stableDirectNames)
             {
-                string text =
-                    多人_简单标识(
-                        获取成员值按名称(
-                            target,
-                            name
-                        )
-                    );
-
-                if (text.Length > 0)
-                    return text;
+                string text = 多人_简单标识(获取成员值按名称(target, name));
+                if (text.Length == 0) continue;
+                string n = name.ToLowerInvariant();
+                if (n.Contains("steam")) return "steam:" + text;
+                if (n.Contains("user")) return "user:" + text;
+                return "player:" + text;
             }
         }
 
@@ -568,42 +543,44 @@ public partial class Plugin
 
         if (view != null)
         {
-            foreach (string name in new string[] { "ViewID", "viewID", "OwnerActorNr", "ownerActorNr" })
-            {
-                string text =
-                    多人_简单标识(
-                        获取成员值按名称(
-                            view,
-                            name
-                        )
-                    );
-
-                if (text.Length > 0)
-                    return "view:" + text;
-            }
-
-            object? owner =
-                获取成员值按名称(view, "Owner")
-                ?? 获取成员值按名称(view, "owner");
-
+            object? owner = 获取成员值按名称(view, "Owner") ?? 获取成员值按名称(view, "owner");
             if (owner != null)
             {
-                foreach (string name in new string[] { "UserId", "userId", "ActorNumber", "actorNumber" })
+                foreach (string name in new string[] { "UserId", "userId" })
                 {
-                    string text =
-                        多人_简单标识(
-                            获取成员值按名称(
-                                owner,
-                                name
-                            )
-                        );
+                    string text = 多人_简单标识(获取成员值按名称(owner, name));
+                    if (text.Length > 0) return "user:" + text;
+                }
 
-                    if (text.Length > 0)
-                        return "owner:" + text;
+                // Owner IDs are weaker than a real user/platform ID, so only
+                // consider them after the Photon owner UserId path above.
+                foreach (object? target in targets)
+                {
+                    if (target == null) continue;
+                    foreach (string name in new string[] { "ownerId", "OwnerId", "ownerID", "OwnerID" })
+                    {
+                        string text = 多人_简单标识(获取成员值按名称(target, name));
+                        if (text.Length > 0) return "owner:" + text;
+                    }
+                }
+
+                foreach (string name in new string[] { "ActorNumber", "actorNumber" })
+                {
+                    string text = 多人_简单标识(获取成员值按名称(owner, name));
+                    if (text.Length > 0) return "actor:" + text;
                 }
             }
+            foreach (string name in new string[] { "OwnerActorNr", "ownerActorNr" })
+            {
+                string text = 多人_简单标识(获取成员值按名称(view, name));
+                if (text.Length > 0) return "actor:" + text;
+            }
+            foreach (string name in new string[] { "ViewID", "viewID" })
+            {
+                string text = 多人_简单标识(获取成员值按名称(view, name));
+                if (text.Length > 0) return "view:" + text;
+            }
         }
-
         return "";
     }
 
