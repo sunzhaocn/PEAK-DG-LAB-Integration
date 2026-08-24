@@ -930,75 +930,6 @@ class TierRow(QFrame):
         }
 
 
-class SpikeTierRow(QFrame):
-    remove_requested = Signal(object)
-
-    def __init__(self, tier=None):
-        super().__init__()
-        tier = tier or {
-            "delta": 50.0,
-            "min_a": 5,
-            "max_a": 5,
-            "min_b": 5,
-            "max_b": 5,
-        }
-        self.setObjectName("tierRow")
-        g = QGridLayout(self)
-        g.setContentsMargins(8, 8, 8, 8)
-        g.setHorizontalSpacing(8)
-        g.setVerticalSpacing(7)
-
-        self.delta = QDoubleSpinBox()
-        self.delta.setRange(0.1, 100.0)
-        self.delta.setDecimals(1)
-        self.delta.setSuffix(" %")
-        self.delta.setValue(float(tier.get("delta", 50.0)))
-
-        self.min_a = QSpinBox(); self.max_a = QSpinBox()
-        self.min_b = QSpinBox(); self.max_b = QSpinBox()
-        for w in (self.min_a, self.max_a, self.min_b, self.max_b):
-            w.setRange(0, B.GUI_INTENSITY_MAX)
-
-        a0, a1 = B.normalize_intensity_range(
-            tier.get("min_a", tier.get("add_a", 5)),
-            tier.get("max_a", tier.get("add_a", 5)), 5, 5
-        )
-        b0, b1 = B.normalize_intensity_range(
-            tier.get("min_b", tier.get("add_b", 5)),
-            tier.get("max_b", tier.get("add_b", 5)), 5, 5
-        )
-        self.min_a.setValue(a0); self.max_a.setValue(a1)
-        self.min_b.setValue(b0); self.max_b.setValue(b1)
-
-        rm = QPushButton("删除档位")
-        rm.setObjectName("dangerGhost")
-        rm.clicked.connect(lambda: self.remove_requested.emit(self))
-
-        g.addWidget(QLabel("单次变化至少"), 0, 0)
-        g.addWidget(self.delta, 0, 1)
-        g.addWidget(rm, 0, 4)
-
-        g.addWidget(QLabel("A 额外随机 +"), 1, 0)
-        g.addWidget(self.min_a, 1, 1)
-        g.addWidget(QLabel("~"), 1, 2)
-        g.addWidget(self.max_a, 1, 3)
-
-        g.addWidget(QLabel("B 额外随机 +"), 2, 0)
-        g.addWidget(self.min_b, 2, 1)
-        g.addWidget(QLabel("~"), 2, 2)
-        g.addWidget(self.max_b, 2, 3)
-        g.setColumnStretch(4, 1)
-
-    def data(self):
-        return {
-            "delta": self.delta.value(),
-            "min_a": min(self.min_a.value(), self.max_a.value()),
-            "max_a": max(self.min_a.value(), self.max_a.value()),
-            "min_b": min(self.min_b.value(), self.max_b.value()),
-            "max_b": max(self.min_b.value(), self.max_b.value()),
-        }
-
-
 class RuleEditor(QFrame):
     def __init__(self, key, display, trigger):
         super().__init__()
@@ -1006,7 +937,6 @@ class RuleEditor(QFrame):
         self.display = display
         self.trigger = trigger
         self.rows = []
-        self.spike_rows = []
         self.setObjectName("glassPanel")
 
         out = QVBoxLayout(self)
@@ -1070,28 +1000,6 @@ class RuleEditor(QFrame):
         bf.addRow("持续时间", self.db)
         bf.addRow("基础波形", self.wb)
         out.addWidget(b_box)
-
-        random_box = QGroupBox("随机强度")
-        rg = QGridLayout(random_box)
-        self.random_enabled = QCheckBox("每次触发随机基础强度")
-        self.random_min_a = QSpinBox(); self.random_max_a = QSpinBox()
-        self.random_min_b = QSpinBox(); self.random_max_b = QSpinBox()
-        for spin in (self.random_min_a, self.random_max_a, self.random_min_b, self.random_max_b):
-            spin.setRange(0, B.GUI_INTENSITY_MAX)
-        rg.addWidget(self.random_enabled, 0, 0, 1, 4)
-        rg.addWidget(QLabel("A 范围"), 1, 0)
-        rg.addWidget(self.random_min_a, 1, 1)
-        rg.addWidget(QLabel("到"), 1, 2)
-        rg.addWidget(self.random_max_a, 1, 3)
-        rg.addWidget(QLabel("B 范围"), 2, 0)
-        rg.addWidget(self.random_min_b, 2, 1)
-        rg.addWidget(QLabel("到"), 2, 2)
-        rg.addWidget(self.random_max_b, 2, 3)
-        random_note = QLabel("开启后，每次触发先从所选范围随机基础强度，再叠加动态档位/瞬时加强；最终仍受本规则最大强度限制。")
-        random_note.setObjectName("muted")
-        random_note.setWordWrap(True)
-        rg.addWidget(random_note, 3, 0, 1, 4)
-        out.addWidget(random_box)
 
         common = QGroupBox("通用")
         cf = QFormLayout(common)
@@ -1239,29 +1147,6 @@ class RuleEditor(QFrame):
 
         out.addWidget(common)
 
-        self.spike_enabled = None
-        self.spike_rows_layout = None
-
-        if B.rule_supports_percentage_tiers(key):
-            spike_box = QGroupBox("瞬时大变化加强（自定义多档）")
-            sv = QVBoxLayout(spike_box)
-            self.spike_enabled = QCheckBox("启用瞬时大变化额外加强")
-            sv.addWidget(self.spike_enabled)
-            spike_note = QLabel(
-                "按单次变化量判断。例如血量 100%→80% 是变化 20%，100%→25% 是变化 75%。"
-                "可以自行添加任意阈值和 A/B 额外随机范围；多档同时命中只取最高阈值一档，不累加。"
-                "把范围两端设成相同数值就是固定额外强度。最终仍受本规则最大强度限制。"
-            )
-            spike_note.setObjectName("muted")
-            spike_note.setWordWrap(True)
-            sv.addWidget(spike_note)
-            self.spike_rows_layout = QVBoxLayout()
-            sv.addLayout(self.spike_rows_layout)
-            add_spike = QPushButton("＋ 添加瞬时变化档位")
-            add_spike.clicked.connect(self.add_spike_tier)
-            sv.addWidget(add_spike, alignment=Qt.AlignmentFlag.AlignLeft)
-            out.addWidget(spike_box)
-
         if B.rule_supports_percentage_tiers(key):
             box = QGroupBox("状态值降低时的动态强度 / 波形档位")
             tl = QVBoxLayout(box)
@@ -1337,24 +1222,6 @@ class RuleEditor(QFrame):
         for r in list(self.rows):
             self.remove_tier(r)
 
-    def add_spike_tier(self, tier=None):
-        if not B.rule_supports_percentage_tiers(self.key) or self.spike_rows_layout is None:
-            return
-        r = SpikeTierRow(tier)
-        r.remove_requested.connect(self.remove_spike_tier)
-        self.spike_rows.append(r)
-        self.spike_rows_layout.addWidget(r)
-
-    def remove_spike_tier(self, r):
-        if r in self.spike_rows:
-            self.spike_rows.remove(r)
-        r.setParent(None)
-        r.deleteLater()
-
-    def clear_spike_tiers(self):
-        for r in list(self.spike_rows):
-            self.remove_spike_tier(r)
-
     def load_rule(self, c):
         self.enabled.setChecked(bool(c.get("enabled", False)))
         self.ia.setValue(B.clamp_int(c.get("intensity_a", 5)))
@@ -1364,32 +1231,6 @@ class RuleEditor(QFrame):
         self.da.setValue(B.clamp_duration(c.get("play_time_a", 5000)))
         self.db.setValue(B.clamp_duration(c.get("play_time_b", 5000)))
         self.cool.setValue(B.clamp_cooldown(c.get("cooldown", 2)))
-
-        self.random_enabled.setChecked(bool(c.get("random_intensity", False)))
-        rmin_a, rmax_a = B.normalize_intensity_range(c.get("random_min_a", 1), c.get("random_max_a", 5), 1, 5)
-        rmin_b, rmax_b = B.normalize_intensity_range(c.get("random_min_b", 1), c.get("random_max_b", 5), 1, 5)
-        self.random_min_a.setValue(rmin_a); self.random_max_a.setValue(rmax_a)
-        self.random_min_b.setValue(rmin_b); self.random_max_b.setValue(rmax_b)
-
-        if self.spike_enabled is not None:
-            self.spike_enabled.setChecked(bool(c.get("spike_enabled", False)))
-            self.clear_spike_tiers()
-            spike_tiers = B.normalize_spike_tiers(c.get("spike_tiers", []))
-            # 自动兼容上一版单阈值配置：首次打开时转换成一个固定范围档位。
-            if not spike_tiers and bool(c.get("spike_enabled", False)):
-                try:
-                    legacy_delta = max(0.1, min(100.0, float(c.get("spike_delta", 50.0))))
-                except Exception:
-                    legacy_delta = 50.0
-                legacy_a = B.clamp_int(c.get("spike_add_a", 5))
-                legacy_b = B.clamp_int(c.get("spike_add_b", 5))
-                spike_tiers = [{
-                    "delta": legacy_delta,
-                    "min_a": legacy_a, "max_a": legacy_a,
-                    "min_b": legacy_b, "max_b": legacy_b,
-                }]
-            for tier in spike_tiers:
-                self.add_spike_tier(tier)
 
         mode = str(
             c.get(
@@ -1496,17 +1337,6 @@ class RuleEditor(QFrame):
                     else 5.0
                 )
             ),
-            "random_intensity": self.random_enabled.isChecked(),
-            "random_min_a": min(self.random_min_a.value(), self.random_max_a.value()),
-            "random_max_a": max(self.random_min_a.value(), self.random_max_a.value()),
-            "random_min_b": min(self.random_min_b.value(), self.random_max_b.value()),
-            "random_max_b": max(self.random_min_b.value(), self.random_max_b.value()),
-            "spike_enabled": self.spike_enabled.isChecked() if self.spike_enabled is not None else False,
-            # 旧字段仅保留兼容；新版实际使用 spike_tiers。
-            "spike_delta": 50.0,
-            "spike_add_a": 0,
-            "spike_add_b": 0,
-            "spike_tiers": [r.data() for r in self.spike_rows] if B.rule_supports_percentage_tiers(self.key) else [],
             "thresholds": [r.data() for r in self.rows] if B.rule_supports_percentage_tiers(self.key) else [],
         }
 
@@ -1528,7 +1358,6 @@ class Window(QMainWindow):
         self.nav_buttons = []
         self.page_indices = {}
         self.last_log_count = -1
-        self.last_log_revision = -1
         self.qr_url = None
         self.selected_wave = None
         self._sidebar_collapsed = False
@@ -2222,7 +2051,6 @@ class Window(QMainWindow):
                 )
 
         self.last_log_count = -1
-        self.last_log_revision = -1
 
         if hasattr(
             self,
@@ -2741,7 +2569,8 @@ class Window(QMainWindow):
         cg = QGridLayout()
         self.conn = {}
         rows = (
-            ("peak", "PEAK"), ("peak_packet", "最近遥测"), ("scene", "场景"),
+            ("peak", "PEAK"), ("peak_packet", "最近遥测"),
+            ("stage", "当前关卡"), ("scene", "内部地图"),
             ("dg", "DG APP"), ("device", "郊狼设备"), ("slot", "slotId"),
             ("ip", "本机 IP"), ("ports", "端口"), ("device_state", "设备状态"),
         )
@@ -2849,7 +2678,8 @@ class Window(QMainWindow):
 
         self.telemetry_stack = QStackedWidget()
         overview_fields = [
-            ("scene","当前场景"),("phase","阶段"),("hasCharacter","角色对象"),
+            ("stageDisplay","当前关卡"),("stageName","当前区域"),("biome","Biome"),
+            ("scene","内部地图"),("phase","阶段"),("hasCharacter","角色对象"),
             ("hp","血量"),("stamina","体力"),("held","手持物"),("speed","速度"),
             ("lastUse","最近使用"),("lastConsume","最近食用/消耗"),
         ]
@@ -2900,8 +2730,23 @@ class Window(QMainWindow):
         el.addWidget(split_extra)
         self.telemetry_stack.addWidget(extra_page)
 
-        raw_page = QWidget(); rl = QVBoxLayout(raw_page)
-        self.raw_json = QTextEdit(); self.raw_json.setReadOnly(True); self.raw_json.setFont(QFont("Consolas", 9))
+        raw_page = QWidget()
+        rl = QVBoxLayout(raw_page)
+
+        raw_toolbar = QHBoxLayout()
+        self.raw_json_pause = QCheckBox("暂停刷新")
+        self.raw_json_pause.setToolTip(
+            "冻结当前原始 JSON，方便向下滚动、选择和检查字段；取消后恢复实时刷新。"
+        )
+        raw_toolbar.addWidget(self.raw_json_pause)
+        raw_toolbar.addStretch(1)
+        rl.addLayout(raw_toolbar)
+
+        self.raw_json = QTextEdit()
+        self.raw_json.setReadOnly(True)
+        self.raw_json.setFont(QFont("Consolas", 9))
+        self._last_raw_json_text = ""
+        self._raw_json_restore_token = 0
         rl.addWidget(self.raw_json)
         self.telemetry_stack.addWidget(raw_page)
 
@@ -2956,6 +2801,9 @@ class Window(QMainWindow):
 
         if category == 0:
             overview = {
+                "stageDisplay": str(p.get("stageDisplay") or "-"),
+                "stageName": str(p.get("stageName") or "-"),
+                "biome": str(p.get("biome") or "-"),
                 "scene": str(p.get("scene") or "-"),
                 "phase": str(p.get("phase") or "-"),
                 "hasCharacter": self.yn(p.get("hasCharacter",True)),
@@ -3026,7 +2874,99 @@ class Window(QMainWindow):
             return
 
         if category == 5:
-            self.raw_json.setPlainText(json.dumps(p,ensure_ascii=False,indent=2))
+            if (
+                hasattr(self, "raw_json_pause")
+                and self.raw_json_pause.isChecked()
+            ):
+                return
+
+            text = json.dumps(
+                p,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+            if text == getattr(
+                self,
+                "_last_raw_json_text",
+                "",
+            ):
+                return
+
+            vertical = self.raw_json.verticalScrollBar()
+            horizontal = self.raw_json.horizontalScrollBar()
+
+            # 用户正在拖动滚动条时不替换文档，避免鼠标下的滑块跳回顶部。
+            if (
+                vertical.isSliderDown()
+                or horizontal.isSliderDown()
+            ):
+                return
+
+            old_v = vertical.value()
+            old_h = horizontal.value()
+            was_bottom = (
+                old_v >= max(
+                    0,
+                    vertical.maximum() - 2,
+                )
+            )
+
+            self._last_raw_json_text = text
+            self._raw_json_restore_token = (
+                getattr(
+                    self,
+                    "_raw_json_restore_token",
+                    0,
+                )
+                + 1
+            )
+            token = self._raw_json_restore_token
+
+            self.raw_json.setUpdatesEnabled(False)
+            try:
+                self.raw_json.setPlainText(text)
+            finally:
+                self.raw_json.setUpdatesEnabled(True)
+
+            def restore_raw_json_scroll():
+                if (
+                    token
+                    != getattr(
+                        self,
+                        "_raw_json_restore_token",
+                        -1,
+                    )
+                ):
+                    return
+
+                vbar = self.raw_json.verticalScrollBar()
+                hbar = self.raw_json.horizontalScrollBar()
+
+                if was_bottom:
+                    vbar.setValue(
+                        vbar.maximum()
+                    )
+                else:
+                    vbar.setValue(
+                        min(
+                            old_v,
+                            vbar.maximum(),
+                        )
+                    )
+
+                hbar.setValue(
+                    min(
+                        old_h,
+                        hbar.maximum(),
+                    )
+                )
+
+            QTimer.singleShot(
+                0,
+                restore_raw_json_scroll,
+            )
+            return
     def build_rules(self):
         l = QVBoxLayout(self.rules_tab)
         l.setContentsMargins(4,4,4,4)
@@ -3230,7 +3170,6 @@ class Window(QMainWindow):
             merged = editor.data()
             for field in common_fields:
                 merged[field] = source.get(field, merged.get(field))
-            # 动态百分比档位 / 瞬时变化档位只在来源和目标都支持时复制。
             if B.rule_supports_percentage_tiers(source_key) and B.rule_supports_percentage_tiers(key):
                 merged["thresholds"] = json.loads(json.dumps(source.get("thresholds", []), ensure_ascii=False))
                 merged["spike_tiers"] = json.loads(json.dumps(source.get("spike_tiers", []), ensure_ascii=False))
@@ -3239,7 +3178,10 @@ class Window(QMainWindow):
 
         self.apply_rules(show=False)
         self.update_rule_group_states()
-        self.feedback(f"已把“{source_editor.display}”的电击参数批量套用到 {len(checked_keys)} 条已勾选规则。", 5000)
+        self.feedback(
+            f"已把“{source_editor.display}”的电击参数批量套用到 {len(checked_keys)} 条已勾选规则。",
+            5000,
+        )
 
     def apply_rules(
         self,
@@ -3282,7 +3224,7 @@ class Window(QMainWindow):
             )
 
         self.feedback(
-            f"✓ {len(B.RULE_META)} 条电击规则已应用到运行时。",
+            "✓ 18 条电击规则已应用到运行时。",
             4500,
         )
 
@@ -3562,20 +3504,6 @@ class Window(QMainWindow):
                         ),
                     ),
                 ),
-                "random_intensity": bool(source.get("random_intensity", False)),
-                "random_min_a": B.normalize_intensity_range(source.get("random_min_a", 1), source.get("random_max_a", 5), 1, 5)[0],
-                "random_max_a": B.normalize_intensity_range(source.get("random_min_a", 1), source.get("random_max_a", 5), 1, 5)[1],
-                "random_min_b": B.normalize_intensity_range(source.get("random_min_b", 1), source.get("random_max_b", 5), 1, 5)[0],
-                "random_max_b": B.normalize_intensity_range(source.get("random_min_b", 1), source.get("random_max_b", 5), 1, 5)[1],
-                "spike_enabled": bool(source.get("spike_enabled", False)),
-                "spike_delta": max(0.1, min(100.0, float(source.get("spike_delta", 50.0)))),
-                "spike_add_a": B.clamp_int(source.get("spike_add_a", 5)),
-                "spike_add_b": B.clamp_int(source.get("spike_add_b", 5)),
-                "spike_tiers": (
-                    B.normalize_spike_tiers(source.get("spike_tiers", []))
-                    if B.rule_supports_percentage_tiers(key)
-                    else []
-                ),
                 "thresholds": (
                     B.normalize_thresholds(
                         source.get(
@@ -3779,7 +3707,7 @@ class Window(QMainWindow):
     def reset_rules(self):
         if not self.ask_confirm(
             "恢复默认规则",
-            f"确定把 {len(B.RULE_META)} 条电击规则恢复为默认值吗？",
+            "确定把 18 条电击规则恢复为默认值吗？",
             "当前界面中尚未保存的强度、时间、波形和动态档位设置都会被覆盖。",
             confirm_text="恢复默认",
             cancel_text="取消",
@@ -3797,12 +3725,12 @@ class Window(QMainWindow):
         B.add_log(
             "系统",
             "规则恢复默认",
-            f"{len(B.RULE_META)} 条规则已恢复默认值",
+            "18 条规则已恢复默认值",
         )
 
         self.msg_info(
             "恢复完成",
-            f"{len(B.RULE_META)} 条规则已经恢复为默认值。",
+            "18 条规则已经恢复为默认值。",
             "如需下次启动继续使用这些默认值，请点击“保存到文件”。",
         )
 
@@ -3890,7 +3818,7 @@ class Window(QMainWindow):
         )
 
         c = QPushButton(
-            "清空全部日志"
+            "清空界面日志"
         )
         c.clicked.connect(
             self.clear_logs
@@ -3902,16 +3830,6 @@ class Window(QMainWindow):
         pl.addLayout(
             top
         )
-
-        search_row = QHBoxLayout()
-        self.log_search = QLineEdit()
-        self.log_search.setPlaceholderText("查找日志：时间 / 类型 / 事件 / 详细内容")
-        self.log_search.textChanged.connect(lambda _=None: self.refresh_logs(force=True))
-        self.log_search_count = QLabel("全部")
-        self.log_search_count.setObjectName("muted")
-        search_row.addWidget(self.log_search, 1)
-        search_row.addWidget(self.log_search_count)
-        pl.addLayout(search_row)
 
         self.logtable = QTableWidget(
             0,
@@ -4116,18 +4034,18 @@ class Window(QMainWindow):
             )
 
     def clear_logs(self):
-        ok, message = B.clear_event_logs(clear_disk=True)
-        self.logtable.setRowCount(0)
-        self.recent.setRowCount(0)
+        self.logtable.setRowCount(
+            0
+        )
+        self.recent.setRowCount(
+            0
+        )
         self.last_log_count = -1
-        self.last_log_revision = -1
-        if hasattr(self, "log_search_count"):
-            self.log_search_count.setText("0 条")
 
-        if ok:
-            self.feedback("日志已完全清空：界面缓存和磁盘事件日志都已删除。", 4500)
-        else:
-            self.feedback(f"内存日志已清空，但磁盘日志清理失败：{message}", 5500)
+        self.feedback(
+            "界面日志已清空；磁盘日志文件没有删除。",
+            4000,
+        )
 
     def build_pair(self):
         l=QHBoxLayout(self.pair);a,al=self.panel("DG-LAB 配对");self.qr=QLabel("等待控制方 ID...");self.qr.setAlignment(Qt.AlignmentFlag.AlignCenter);self.qr.setMinimumSize(360,360);al.addWidget(self.qr,1);self.url=QLineEdit();self.url.setReadOnly(True);al.addWidget(self.url);cp=QPushButton("复制配对地址");cp.clicked.connect(self.copy_pair_url);al.addWidget(cp,alignment=Qt.AlignmentFlag.AlignRight);b,bl=self.panel("连接详细信息");f=QFormLayout();self.detail={}
@@ -7056,57 +6974,83 @@ class Window(QMainWindow):
             else "否"
         )
 
-    def refresh_logs(self, force=False):
+    def refresh_logs(self):
         with B.log_lock:
-            logs = list(B.event_logs)
-            revision = int(getattr(B, "log_revision", len(logs)))
-
-        query = ""
-        if hasattr(self, "log_search"):
-            query = self.log_search.text().strip().lower()
-
-        if not force and revision == getattr(self, "last_log_revision", -1):
-            return
-
-        self.last_log_revision = revision
-        self.last_log_count = len(logs)
-
-        localized_all = [I18N.localize_log_record(item) for item in logs]
-        if query:
-            localized = [
-                item for item in localized_all
-                if query in " ".join((
-                    str(item.get("time", "")),
-                    str(item.get("category", "")),
-                    str(item.get("event", "")),
-                    str(item.get("detail", "")),
-                )).lower()
-            ]
-        else:
-            localized = localized_all
-
-        if hasattr(self, "log_search_count"):
-            self.log_search_count.setText(
-                f"{len(localized)} / {len(localized_all)} 条" if query else f"{len(localized_all)} 条"
+            logs = list(
+                B.event_logs
             )
 
-        self.logtable.setRowCount(len(localized))
-        for row, item in enumerate(localized):
-            values = (item["time"], item["category"], item["event"], item["detail"])
-            for column, value in enumerate(values):
-                self.logtable.setItem(row, column, QTableWidgetItem(str(value)))
+        if (
+            len(logs)
+            == self.last_log_count
+        ):
+            return
 
-        # 总览最近事件始终显示完整日志的最后 12 条，不受搜索框过滤。
-        recent = localized_all[-12:]
-        self.recent.setRowCount(len(recent))
-        for row, item in enumerate(recent):
-            values = (item["time"], item["category"], item["event"], item["detail"])
-            for column, value in enumerate(values):
-                self.recent.setItem(row, column, QTableWidgetItem(str(value)))
+        self.last_log_count = len(
+            logs
+        )
+
+        localized = [
+            I18N.localize_log_record(
+                item
+            )
+            for item in logs
+        ]
+
+        self.logtable.setRowCount(
+            len(localized)
+        )
+
+        for row, item in enumerate(
+            localized
+        ):
+            values = (
+                item["time"],
+                item["category"],
+                item["event"],
+                item["detail"],
+            )
+
+            for column, value in enumerate(
+                values
+            ):
+                self.logtable.setItem(
+                    row,
+                    column,
+                    QTableWidgetItem(
+                        str(value)
+                    ),
+                )
+
+        recent = localized[-12:]
+
+        self.recent.setRowCount(
+            len(recent)
+        )
+
+        for row, item in enumerate(
+            recent
+        ):
+            values = (
+                item["time"],
+                item["category"],
+                item["event"],
+                item["detail"],
+            )
+
+            for column, value in enumerate(
+                values
+            ):
+                self.recent.setItem(
+                    row,
+                    column,
+                    QTableWidgetItem(
+                        str(value)
+                    ),
+                )
 
         if localized:
             self.logtable.scrollToBottom()
-        if recent:
             self.recent.scrollToBottom()
 
     def refresh_ui(self):
@@ -7142,8 +7086,12 @@ class Window(QMainWindow):
         ]
 
         if peak_state == "in_game":
-            peak_base = I18N.tr(
-                "局内 / 遥测中"
+            raw_stage = (
+                (p or {}).get("stageDisplay")
+                or "局内 / 遥测中"
+            )
+            peak_base = I18N.tr_dynamic(
+                str(raw_stage)
             )
             peak_text = (
                 "● "
@@ -7252,6 +7200,19 @@ class Window(QMainWindow):
             "peak_packet"
         ].setText(
             packet_text
+        )
+
+        stage_display = str(
+            (p or {}).get("stageDisplay")
+            or "-"
+        )
+
+        self.conn[
+            "stage"
+        ].setText(
+            I18N.tr_dynamic(
+                stage_display
+            )
         )
 
         scene = str(

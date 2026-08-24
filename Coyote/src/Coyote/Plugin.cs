@@ -75,6 +75,17 @@ public partial class Plugin : BaseUnityPlugin
         public bool inferred = false;
     }
 
+    // PEAK 当前真实关卡信息。scene 仅保留为 Unity 内部地图名，
+    // 对用户展示的关卡优先使用 MapHandler / MountainProgressHandler。
+    private sealed class 关卡信息
+    {
+        public int segmentIndex = -1;
+        public int stageNumber = 0;
+        public string stageName = "";
+        public string biome = "";
+        public string stageDisplay = "";
+    }
+
     // ============================================================
     // 启动
     // ============================================================
@@ -369,11 +380,14 @@ public partial class Plugin : BaseUnityPlugin
                 玩家
             );
 
+        关卡信息 当前关卡 =
+            读取当前关卡();
+
         string json =
             构造局内JSON(
                 sceneName,
+                当前关卡,
                 玩家,
-                状态管理器,
                 状态,
                 血量,
                 受伤值,
@@ -1197,6 +1211,127 @@ public partial class Plugin : BaseUnityPlugin
     }
 
 
+
+    // ============================================================
+    // PEAK 真实关卡 / Segment
+    // ============================================================
+
+    private 关卡信息 读取当前关卡()
+    {
+        关卡信息 info =
+            new 关卡信息();
+
+        try
+        {
+            MapHandler mapHandler =
+                UnityEngine.Object
+                .FindFirstObjectByType<MapHandler>();
+
+            if (mapHandler == null)
+                return info;
+
+            Segment segment =
+                mapHandler.GetCurrentSegment();
+
+            int index =
+                (int)segment;
+
+            info.segmentIndex =
+                index;
+
+            if (index >= 0)
+            {
+                info.stageNumber =
+                    index + 1;
+            }
+
+            try
+            {
+                object biome =
+                    mapHandler.GetCurrentBiome();
+
+                info.biome =
+                    biome != null
+                    ? biome.ToString() ?? ""
+                    : "";
+            }
+            catch
+            {
+                info.biome = "";
+            }
+
+            try
+            {
+                MountainProgressHandler progress =
+                    UnityEngine.Object
+                    .FindFirstObjectByType<MountainProgressHandler>();
+
+                if (
+                    progress != null &&
+                    progress.progressPoints != null &&
+                    index >= 0 &&
+                    index < progress.progressPoints.Length
+                )
+                {
+                    string title =
+                        progress.progressPoints[index].title
+                        ?? "";
+
+                    if (!string.IsNullOrWhiteSpace(title))
+                    {
+                        info.stageName =
+                            title.Trim();
+                    }
+                }
+            }
+            catch
+            {
+                info.stageName = "";
+            }
+
+            if (string.IsNullOrWhiteSpace(info.stageName))
+            {
+                info.stageName =
+                    关卡默认名称(index);
+            }
+
+            if (info.stageNumber > 0)
+            {
+                info.stageDisplay =
+                    $"第{info.stageNumber}关";
+
+                if (!string.IsNullOrWhiteSpace(info.stageName))
+                {
+                    info.stageDisplay +=
+                        $" · {info.stageName}";
+                }
+            }
+        }
+        catch
+        {
+            // 地图切换 / 加载期间读取不到 MapHandler 时保持空值，
+            // 不影响其余 PEAK 遥测和电击规则。
+        }
+
+        return info;
+    }
+
+    private static string 关卡默认名称(
+        int index
+    )
+    {
+        switch (index)
+        {
+            case 0: return "Shore";
+            case 1: return "Tropics";
+            case 2: return "Alpine";
+            case 3: return "Caldera";
+            case 4: return "The Kiln";
+            case 5: return "PEAK";
+            default: return "";
+        }
+    }
+
     // ============================================================
     // JSON
     // ============================================================
@@ -1213,7 +1348,7 @@ public partial class Plugin : BaseUnityPlugin
         追加数字(
             json,
             "telemetryVersion",
-            4,
+            5,
             first: true
         );
 
@@ -1242,8 +1377,8 @@ public partial class Plugin : BaseUnityPlugin
 
     private string 构造局内JSON(
         string sceneName,
+        关卡信息 当前关卡,
         Character 玩家,
-        CharacterAfflictions 状态管理器,
         float[] 状态,
         float 血量,
         float 受伤值,
@@ -1280,7 +1415,7 @@ public partial class Plugin : BaseUnityPlugin
         追加数字(
             json,
             "telemetryVersion",
-            4,
+            5,
             first: true
         );
 
@@ -1288,6 +1423,36 @@ public partial class Plugin : BaseUnityPlugin
             json,
             "scene",
             sceneName
+        );
+
+        追加数字(
+            json,
+            "segmentIndex",
+            当前关卡.segmentIndex
+        );
+
+        追加数字(
+            json,
+            "stageNumber",
+            当前关卡.stageNumber
+        );
+
+        追加字符串(
+            json,
+            "stageName",
+            当前关卡.stageName
+        );
+
+        追加字符串(
+            json,
+            "biome",
+            当前关卡.biome
+        );
+
+        追加字符串(
+            json,
+            "stageDisplay",
+            当前关卡.stageDisplay
         );
 
         追加布尔(
@@ -1542,15 +1707,8 @@ public partial class Plugin : BaseUnityPlugin
             if (i > 0)
                 json.Append(",");
 
-            float 当前状态值 =
-                获取当前状态值安全(
-                    状态管理器,
-                    i,
-                    状态[i]
-                );
-
             json.Append(
-                当前状态值.ToString(
+                状态[i].ToString(
                     "F4",
                     CultureInfo.InvariantCulture
                 )
@@ -1625,71 +1783,6 @@ public partial class Plugin : BaseUnityPlugin
         json.Append("}");
 
         return json.ToString();
-    }
-
-    private static float 获取当前状态值安全(
-        CharacterAfflictions 状态管理器,
-        int index,
-        float fallback
-    )
-    {
-        try
-        {
-            Type type =
-                状态管理器.GetType();
-
-            BindingFlags flags =
-                BindingFlags.Instance |
-                BindingFlags.Public |
-                BindingFlags.NonPublic;
-
-            MethodInfo? method =
-                type.GetMethod(
-                    "GetCurrentStatus",
-                    flags,
-                    null,
-                    new Type[]
-                    {
-                        typeof(
-                            CharacterAfflictions.STATUSTYPE
-                        )
-                    },
-                    null
-                );
-
-            if (method != null)
-            {
-                object? value =
-                    method.Invoke(
-                        状态管理器,
-                        new object[]
-                        {
-                            (CharacterAfflictions.STATUSTYPE)index
-                        }
-                    );
-
-                if (value != null)
-                {
-                    float current =
-                        Convert.ToSingle(
-                            value,
-                            CultureInfo.InvariantCulture
-                        );
-
-                    if (
-                        !float.IsNaN(current) &&
-                        !float.IsInfinity(current)
-                    )
-                        return current;
-                }
-            }
-        }
-        catch
-        {
-            // 兼容旧版/改版 PEAK：读取失败时继续使用 currentStatuses。
-        }
-
-        return fallback;
     }
 
     private static object? 获取成员值按名称(

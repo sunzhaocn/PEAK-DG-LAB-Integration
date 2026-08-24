@@ -1115,15 +1115,38 @@ def install_ui(UI) -> None:
                     self.net_info["phone"].setText("-")
 
             with B.dg_lock:
-                server_state = _s(B.dg.get("server", "")) or "-"
+                server_state = _s(B.dg.get("server", ""))
                 controller_id = _s(B.dg.get("controller_id", ""))
+
             if selected != applied:
                 self.net_info["state"].setText(
                     f"未应用（当前实际：{MODE_LABELS.get(applied, applied)}）"
                 )
             else:
-                suffix = " · 已取得控制方 ID" if controller_id else ""
-                self.net_info["state"].setText(server_state + suffix)
+                mode_text = MODE_LABELS.get(
+                    applied,
+                    applied,
+                )
+
+                waiting_states = {
+                    "",
+                    "-",
+                    "等待连接",
+                    "等待连接中",
+                    "等待 DG-LAB APP",
+                    "等待 DG-LAB APP 接入",
+                }
+
+                if controller_id:
+                    detail = " · 已取得控制方 ID"
+                elif server_state in waiting_states:
+                    detail = " · 等待 DG-LAB APP 接入"
+                else:
+                    detail = " · " + server_state
+
+                self.net_info["state"].setText(
+                    f"已应用：{mode_text}{detail}"
+                )
 
             name, url = official_name_url()
             self.net_official_name.setText(name)
