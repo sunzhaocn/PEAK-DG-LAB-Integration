@@ -18,6 +18,13 @@
     <ThunderstoreCategories>mods</ThunderstoreCategories>
   </PropertyGroup>
 
+  <!-- CI can supply a declaration-only PEAK API reference assembly without
+       committing proprietary game binaries. Local builds continue to use the
+       real PEAK Managed directory through Directory.Build.targets. -->
+  <ItemGroup Condition="'$(PEAK_REFERENCE_ASSEMBLY)' != '' And Exists('$(PEAK_REFERENCE_ASSEMBLY)')">
+    <Reference Include="Assembly-CSharp" HintPath="$(PEAK_REFERENCE_ASSEMBLY)" Private="false" />
+  </ItemGroup>
+
   <ItemGroup>
     <ModFile Include="$(TargetPath)" Destination="plugins/" />
   </ItemGroup>

@@ -1,0 +1,121 @@
+name: Build Windows Portable and Release
+
+on:
+  pull_request:
+    paths:
+      - 'Coyote/**'
+      - '.github/workflows/release.yml'
+      - 'RELEASE_NOTES_0.0.3.md'
+  push:
+    branches: [main]
+    paths:
+      - 'Coyote/**'
+      - '.github/workflows/release.yml'
+      - 'RELEASE_NOTES_0.0.3.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $text = Get-Content 'Coyote/src/Coyote/app_version.py' -Raw
+          if ($text -notmatch 'APP_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') { throw 'APP_VERSION not found' }
+          $version = $Matches[1]
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building Coyote $version"
+
+      - name: Put bun.exe into DG-LAB server directory
+        shell: pwsh
+        run: |
+          $bun = (Get-Command bun.exe -ErrorAction Stop).Source
+          $target = 'Coyote/dglab-websocket-server-main/bun.exe'
+          Copy-Item -LiteralPath $bun -Destination $target -Force
+          if (-not (Test-Path -LiteralPath $target)) { throw 'bun.exe copy failed' }
+          & $target --version
+          Get-Item $target | Format-Table FullName,Length
+
+      - name: Build declaration-only PEAK reference assembly
+        shell: pwsh
+        run: dotnet build 'Coyote/reference-stubs/Assembly-CSharp.csproj' -c Release
+
+      - name: Build Windows x64 portable package from source
+        shell: pwsh
+        working-directory: Coyote
+        env:
+          PEAK_REFERENCE_ASSEMBLY: ${{ github.workspace }}\Coyote\artifacts\bin\Assembly-CSharp\release\Assembly-CSharp.dll
+        run: .\build_exe_selfcontained.ps1
+
+      - name: Validate portable output
+        shell: pwsh
+        run: |
+          $zip = 'Coyote/release/Coyote_Windows_x64_Portable.zip'
+          $exe = 'Coyote/dist/Coyote/Coyote.exe'
+          $dll = 'Coyote/dist/Coyote/plugin/Coyote.dll'
+          $bun = 'Coyote/dist/Coyote/dglab-websocket-server-main/bun.exe'
+          foreach ($path in @($zip,$exe,$dll,$bun)) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "Missing release output: $path" }
+          }
+          if (Test-Path -LiteralPath 'Coyote/dist/Coyote/reference-stubs') { throw 'Reference stubs must not ship in the release.' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          try {
+            $entry = $archive.Entries | Where-Object { $_.FullName -replace '\\','/' -eq 'dglab-websocket-server-main/bun.exe' } | Select-Object -First 1
+            if (-not $entry) { throw 'Portable ZIP does not contain dglab-websocket-server-main/bun.exe' }
+          }
+          finally { $archive.Dispose() }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          "$hash  Coyote_Windows_x64_Portable.zip" | Set-Content -Encoding ascii 'Coyote/release/Coyote_Windows_x64_Portable.zip.sha256'
+          Get-Item $zip,$exe,$dll,$bun | Format-Table FullName,Length
+          Write-Host "SHA256 $hash"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Coyote-Windows-x64-${{ steps.version.outputs.version }}
+          path: |
+            Coyote/release/Coyote_Windows_x64_Portable.zip
+            Coyote/release/Coyote_Windows_x64_Portable.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release and upload package
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release view $env:VERSION --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:VERSION already exists; refusing to overwrite it."
+          }
+          $notes = "RELEASE_NOTES_$env:VERSION.md"
+          if (-not (Test-Path -LiteralPath $notes)) { throw "Missing release notes: $notes" }
+          gh release create $env:VERSION `
+            'Coyote/release/Coyote_Windows_x64_Portable.zip' `
+            'Coyote/release/Coyote_Windows_x64_Portable.zip.sha256' `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "Coyote $env:VERSION" `
+            --notes-file $notes
