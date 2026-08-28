@@ -46,9 +46,15 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           Write-Host "Building Coyote $version"
 
+      - name: Build declaration-only PEAK reference assembly
+        shell: pwsh
+        run: dotnet build 'Coyote/reference-stubs/Assembly-CSharp.csproj' -c Release
+
       - name: Build Windows x64 portable package from source
         shell: pwsh
         working-directory: Coyote
+        env:
+          PEAK_REFERENCE_ASSEMBLY: ${{ github.workspace }}\Coyote\reference-stubs\bin\Release\netstandard2.1\Assembly-CSharp.dll
         run: .\build_exe_selfcontained.ps1
 
       - name: Validate portable output
@@ -60,6 +66,7 @@ jobs:
           foreach ($path in @($zip,$exe,$dll)) {
             if (-not (Test-Path -LiteralPath $path)) { throw "Missing release output: $path" }
           }
+          if (Test-Path -LiteralPath 'Coyote/dist/Coyote/reference-stubs') { throw 'Reference stubs must not ship in the release.' }
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
           "$hash  Coyote_Windows_x64_Portable.zip" | Set-Content -Encoding ascii 'Coyote/release/Coyote_Windows_x64_Portable.zip.sha256'
           Get-Item $zip,$exe,$dll | Format-Table FullName,Length
