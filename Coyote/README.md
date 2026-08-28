@@ -1,16 +1,28 @@
 # Coyote
 
-Coyote is a PEAK BepInEx plugin with a companion Windows GUI used to receive game telemetry and apply configured DG-LAB stimulation rules.
+Coyote is the PEAK-side plugin and companion Windows desktop application used by **PEAK-DG-LAB-Integration** to receive game telemetry and apply configured DG-LAB output rules.
+
+The repository is an unofficial community project and is not affiliated with PEAK, DG-LAB, BepInEx or Thunderstore.
+
+## Source boundaries
+
+- `src/Coyote/Plugin.cs` and `MultiplayerTelemetry.cs`: PEAK/BepInEx telemetry plugin.
+- `src/Coyote/backend.py`: shared rule engine, DG-LAB operations, configuration and logging.
+- `src/Coyote/*_features.py`: extension layers installed from `main.py`.
+- `src/Coyote/ui_qt.py`: Qt desktop UI.
+- `custom_rules/`: user-authored rules loaded through the constrained rule interface.
+- `dglab-websocket-server-main/`: vendored upstream-derived DG-LAB WebSocket server; see the repository-root `NOTICE.md`.
+
+## Versions
+
+The desktop application version and BepInEx plugin version are independent by design. See `../docs/VERSIONING.md` before changing either number.
 
 ## Local build
 
-Run `build_exe_selfcontained.bat` on Windows.
+Run `build_exe_selfcontained.bat` on Windows. The builder compiles `src/Coyote/Coyote.csproj` with Thunderstore packaging disabled for the portable build, packages the Python GUI, and copies the newly built `Coyote.dll` into the portable output.
 
-The EXE builder compiles `src/Coyote/Coyote.csproj` first, with Thunderstore packaging disabled for this local portable build, then packages the Python GUI and copies the freshly built `Coyote.dll` into `plugin/`.
+Thunderstore publishing is intentionally **disabled by default** in source metadata. A maintainer who wants to publish must explicitly configure the local team metadata and opt in.
 
-## Project files
+## License
 
-- `src/Coyote/Plugin.cs`: PEAK/BepInEx plugin telemetry.
-- `src/Coyote/backend.py`: rule engine, DG-LAB control, logging.
-- `src/Coyote/ui_qt.py`: Qt interface.
-- `build_exe_selfcontained.bat`: Windows build entry point.
+Coyote is distributed under GPL-3.0. `LICENSE` in this directory intentionally matches the repository-root GPL license.
