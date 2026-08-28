@@ -6,7 +6,4 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <Nullable>enable</Nullable>
   </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="UnityEngine.Modules" Version="6000.0.36" PrivateAssets="all" />
-  </ItemGroup>
 </Project>
