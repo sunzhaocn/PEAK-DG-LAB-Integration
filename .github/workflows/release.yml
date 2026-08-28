@@ -1,0 +1,96 @@
+name: Build Windows Portable and Release
+
+on:
+  pull_request:
+    paths:
+      - 'Coyote/**'
+      - '.github/workflows/release.yml'
+      - 'RELEASE_NOTES_0.0.3.md'
+  push:
+    branches: [main]
+    paths:
+      - 'Coyote/**'
+      - '.github/workflows/release.yml'
+      - 'RELEASE_NOTES_0.0.3.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $text = Get-Content 'Coyote/src/Coyote/app_version.py' -Raw
+          if ($text -notmatch 'APP_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') { throw 'APP_VERSION not found' }
+          $version = $Matches[1]
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building Coyote $version"
+
+      - name: Build Windows x64 portable package from source
+        shell: pwsh
+        working-directory: Coyote
+        run: .\build_exe_selfcontained.ps1
+
+      - name: Validate portable output
+        shell: pwsh
+        run: |
+          $zip = 'Coyote/release/Coyote_Windows_x64_Portable.zip'
+          $exe = 'Coyote/dist/Coyote/Coyote.exe'
+          $dll = 'Coyote/dist/Coyote/plugin/Coyote.dll'
+          foreach ($path in @($zip,$exe,$dll)) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "Missing release output: $path" }
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          "$hash  Coyote_Windows_x64_Portable.zip" | Set-Content -Encoding ascii 'Coyote/release/Coyote_Windows_x64_Portable.zip.sha256'
+          Get-Item $zip,$exe,$dll | Format-Table FullName,Length
+          Write-Host "SHA256 $hash"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Coyote-Windows-x64-${{ steps.version.outputs.version }}
+          path: |
+            Coyote/release/Coyote_Windows_x64_Portable.zip
+            Coyote/release/Coyote_Windows_x64_Portable.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release and upload package
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release view $env:VERSION --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:VERSION already exists; refusing to overwrite it."
+          }
+          $notes = "RELEASE_NOTES_$env:VERSION.md"
+          if (-not (Test-Path -LiteralPath $notes)) { throw "Missing release notes: $notes" }
+          gh release create $env:VERSION `
+            'Coyote/release/Coyote_Windows_x64_Portable.zip' `
+            'Coyote/release/Coyote_Windows_x64_Portable.zip.sha256' `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "Coyote $env:VERSION" `
+            --notes-file $notes
