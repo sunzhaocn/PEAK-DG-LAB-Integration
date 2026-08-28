@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Python packaging / portable build
+build/
+dist/
+release/
+artifacts/
+*.spec
+.Coyote.generated.spec
+
+# .NET / IDE
+**/bin/
+**/obj/
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+Coyote/Config.Build.user.props
+
+# Runtime / local state
+Coyote/logs/
+Coyote/coyote_gui_config.json
+Coyote/*.log
+Coyote/src/Coyote/*.log
+
+# Bundled/generated binaries
+Coyote/dglab-websocket-server-main/bun.exe
+Coyote/plugin/
+*.exe
+*.dll
+*.pdb
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+
+# OS / archives
+.DS_Store
+Thumbs.db
+*.zip
+*.7z
+*.tar.gz

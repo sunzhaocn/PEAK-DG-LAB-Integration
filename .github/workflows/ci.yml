@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile Python sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import py_compile
+
+          roots = [Path('Coyote/src/Coyote'), Path('Coyote/custom_rules')]
+          files = sorted(p for root in roots if root.exists() for p in root.rglob('*.py'))
+          if not files:
+              raise SystemExit('no Python sources found')
+          for path in files:
+              py_compile.compile(str(path), doraise=True)
+          print(f'compiled {len(files)} Python files')
+          PY
+
+      - name: Validate JSON and XML metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          import xml.etree.ElementTree as ET
+
+          json_files = list(Path('Coyote/src/Coyote/language').glob('*.json'))
+          json_files += [Path('Coyote/src/Coyote/official_relay.json')]
+          for path in json_files:
+              json.loads(path.read_text(encoding='utf-8-sig'))
+
+          for path in [
+              Path('Coyote/src/Coyote/Coyote.csproj'),
+              Path('Coyote/Directory.Build.props'),
+              Path('Coyote/Directory.Build.targets'),
+          ]:
+              ET.parse(path)
+          print('metadata OK')
+          PY
+
+      - name: Reject release-template placeholders
+        shell: bash
+        run: |
+          set -euo pipefail
+          ! grep -RInE \
+            'TODO_team_name_here|Choose an appropriate license|TODO: Fill in short mod description' \
+            Coyote --exclude-dir=dglab-websocket-server-main
+
+      - name: Verify nested license is GPL-3.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp LICENSE Coyote/LICENSE
+
+      - name: Verify vendored DG-LAB license is retained
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s Coyote/dglab-websocket-server-main/LICENSE
+          grep -q 'GNU GENERAL PUBLIC LICENSE' Coyote/dglab-websocket-server-main/LICENSE
