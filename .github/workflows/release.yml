@@ -46,6 +46,16 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           Write-Host "Building Coyote $version"
 
+      - name: Put bun.exe into DG-LAB server directory
+        shell: pwsh
+        run: |
+          $bun = (Get-Command bun.exe -ErrorAction Stop).Source
+          $target = 'Coyote/dglab-websocket-server-main/bun.exe'
+          Copy-Item -LiteralPath $bun -Destination $target -Force
+          if (-not (Test-Path -LiteralPath $target)) { throw 'bun.exe copy failed' }
+          & $target --version
+          Get-Item $target | Format-Table FullName,Length
+
       - name: Build declaration-only PEAK reference assembly
         shell: pwsh
         run: dotnet build 'Coyote/reference-stubs/Assembly-CSharp.csproj' -c Release
@@ -54,7 +64,7 @@ jobs:
         shell: pwsh
         working-directory: Coyote
         env:
-          PEAK_REFERENCE_ASSEMBLY: ${{ github.workspace }}\Coyote\reference-stubs\bin\Release\netstandard2.1\Assembly-CSharp.dll
+          PEAK_REFERENCE_ASSEMBLY: ${{ github.workspace }}\Coyote\artifacts\bin\Assembly-CSharp\release\Assembly-CSharp.dll
         run: .\build_exe_selfcontained.ps1
 
       - name: Validate portable output
@@ -63,13 +73,21 @@ jobs:
           $zip = 'Coyote/release/Coyote_Windows_x64_Portable.zip'
           $exe = 'Coyote/dist/Coyote/Coyote.exe'
           $dll = 'Coyote/dist/Coyote/plugin/Coyote.dll'
-          foreach ($path in @($zip,$exe,$dll)) {
+          $bun = 'Coyote/dist/Coyote/dglab-websocket-server-main/bun.exe'
+          foreach ($path in @($zip,$exe,$dll,$bun)) {
             if (-not (Test-Path -LiteralPath $path)) { throw "Missing release output: $path" }
           }
           if (Test-Path -LiteralPath 'Coyote/dist/Coyote/reference-stubs') { throw 'Reference stubs must not ship in the release.' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          try {
+            $entry = $archive.Entries | Where-Object { $_.FullName -replace '\\','/' -eq 'dglab-websocket-server-main/bun.exe' } | Select-Object -First 1
+            if (-not $entry) { throw 'Portable ZIP does not contain dglab-websocket-server-main/bun.exe' }
+          }
+          finally { $archive.Dispose() }
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
           "$hash  Coyote_Windows_x64_Portable.zip" | Set-Content -Encoding ascii 'Coyote/release/Coyote_Windows_x64_Portable.zip.sha256'
-          Get-Item $zip,$exe,$dll | Format-Table FullName,Length
+          Get-Item $zip,$exe,$dll,$bun | Format-Table FullName,Length
           Write-Host "SHA256 $hash"
 
       - uses: actions/upload-artifact@v4
