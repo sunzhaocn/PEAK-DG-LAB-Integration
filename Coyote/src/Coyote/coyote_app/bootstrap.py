@@ -15,6 +15,7 @@ from coyote_app.features import reporting as REPORT
 from coyote_app.visual_rules import engine as VIS
 from coyote_app.visual_rules import integration as VIS_INTEGRATION
 from coyote_app.visual_rules import policy as VIS_POLICY
+from coyote_app.visual_rules import usability as VIS_USABILITY
 import update_checker as UPDATE
 
 
@@ -50,6 +51,7 @@ def install_ui_extensions(ui_module) -> None:
         VIS.install_ui,
         VIS_INTEGRATION.install_ui,
         VIS_POLICY.install_ui,
+        VIS_USABILITY.install_ui,
     )
     for installer in installers:
         installer(ui_module)
