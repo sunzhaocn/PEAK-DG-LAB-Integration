@@ -29,6 +29,9 @@ UPDATE.install_ui(ui_qt)
 # Install the graph editor last so it replaces only the legacy Python custom-rule
 # page after every other UI extension has finished subclassing Window.
 VIS.install_ui(ui_qt)
+# Then enrich the graph editor with detector-owned parameters (speed threshold,
+# item filters, recovery/area settings) and the existing intensity-ramp options.
+VIS_HARDENING.install_ui(ui_qt)
 
 
 if __name__ == "__main__":
