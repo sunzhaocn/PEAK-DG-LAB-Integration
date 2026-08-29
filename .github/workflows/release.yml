@@ -17,6 +17,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: coyote-windows-release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
@@ -106,6 +110,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          $latestMain = (gh api "repos/$env:GITHUB_REPOSITORY/branches/main" --jq '.commit.sha').Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to resolve the latest main commit before release publishing.' }
+          if ($latestMain -ne $env:GITHUB_SHA) {
+            Write-Host "Skipping stale build $env:GITHUB_SHA; current main is $latestMain."
+            exit 0
+          }
+
           gh release view $env:VERSION --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $env:VERSION already exists; replacing package assets without changing version or release notes."
