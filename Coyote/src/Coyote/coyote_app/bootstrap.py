@@ -12,6 +12,7 @@ from coyote_app.features import extended as EXT
 from coyote_app.features import multiplayer as MP
 from coyote_app.features import network as NET
 from coyote_app.features import reporting as REPORT
+from coyote_app.ui import app_icon as APP_ICON
 from coyote_app.visual_rules import engine as VIS
 from coyote_app.visual_rules import integration as VIS_INTEGRATION
 from coyote_app.visual_rules import policy as VIS_POLICY
@@ -52,6 +53,7 @@ def install_ui_extensions(ui_module) -> None:
         VIS_INTEGRATION.install_ui,
         VIS_POLICY.install_ui,
         VIS_USABILITY.install_ui,
+        APP_ICON.install_ui,
     )
     for installer in installers:
         installer(ui_module)

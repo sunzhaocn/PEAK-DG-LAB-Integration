@@ -99,7 +99,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Create GitHub Release and upload package
+      - name: Publish GitHub Release package
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         env:
@@ -108,8 +108,16 @@ jobs:
         run: |
           gh release view $env:VERSION --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
-            throw "Release $env:VERSION already exists; refusing to overwrite it."
+            Write-Host "Release $env:VERSION already exists; replacing package assets without changing version or release notes."
+            gh release upload $env:VERSION `
+              'Coyote/release/Coyote_Windows_x64_Portable.zip' `
+              'Coyote/release/Coyote_Windows_x64_Portable.zip.sha256' `
+              --repo $env:GITHUB_REPOSITORY `
+              --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Failed to replace release assets for $env:VERSION" }
+            exit 0
           }
+
           $notes = "RELEASE_NOTES_$env:VERSION.md"
           if (-not (Test-Path -LiteralPath $notes)) { throw "Missing release notes: $notes" }
           gh release create $env:VERSION `
