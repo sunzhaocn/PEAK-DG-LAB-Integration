@@ -1,11 +1,50 @@
-# Runtime user documentation
+# Coyote 使用文档
 
-Files in this directory are copied into the Windows portable package and are
-intended to be readable from inside the Coyote desktop application.
+这个目录里的文档全部面向普通用户。
 
-- `Coyote软件介绍.md` — user-facing feature overview.
-- `图形化规则使用说明.md` — visual node-rule editor and rule-domain behavior.
+如果你第一次使用 Coyote，建议按下面顺序阅读。
 
-Developer architecture belongs in repository-root `docs/`, not here. The legacy
-Python custom-rule development guide was removed because user-authored Python is
-no longer the active custom-rule format.
+## 1. Coyote软件介绍.md
+
+先了解软件能做什么，包括：
+
+- PEAK 状态读取；
+- DG-LAB 设备控制；
+- 软件自带规则；
+- 图形化自定义规则；
+- 死亡 / 昏迷规则；
+- 多人联机；
+- 网络连接方式。
+
+## 2. 快速上手.md
+
+适合第一次安装和使用。
+
+主要介绍：
+
+- 怎么确认 PEAK 插件正常；
+- 怎么连接 DG-LAB App；
+- 怎么做低强度测试；
+- 怎么开启第一条自动规则；
+- 怎么排查规则不触发。
+
+## 3. 图形化规则使用说明.md
+
+适合需要自己搭建规则的用户。
+
+主要介绍：
+
+- 怎么添加和连接模块；
+- 怎么设置强度、时间和波形；
+- 怎么用比较、AND / OR / NOT；
+- 怎么使用冷却和边沿；
+- 怎么做物品、状态和区域规则；
+- 怎么设置死亡 / 昏迷保护；
+- 怎么只使用自己的图形规则；
+- 常见规则案例和排错方法。
+
+---
+
+如果你只想使用软件自带规则，阅读 **软件介绍 + 快速上手** 就够了。
+
+如果你想创建复杂的自定义联动，再继续阅读 **图形化规则使用说明**。
