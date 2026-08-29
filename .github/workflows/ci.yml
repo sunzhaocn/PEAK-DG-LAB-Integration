@@ -17,6 +17,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Validate repository structure
+        run: python Coyote/tools/validate_structure.py
+
       - name: Compile Python sources
         shell: bash
         run: |
@@ -25,8 +28,14 @@ jobs:
           from pathlib import Path
           import py_compile
 
-          roots = [Path('Coyote/src/Coyote'), Path('Coyote/custom_rules')]
-          files = sorted(p for root in roots if root.exists() for p in root.rglob('*.py'))
+          roots = [Path('Coyote/src/Coyote'), Path('Coyote/tools')]
+          files = sorted(
+              path
+              for root in roots
+              if root.exists()
+              for path in root.rglob('*.py')
+              if '__pycache__' not in path.parts
+          )
           if not files:
               raise SystemExit('no Python sources found')
           for path in files:
@@ -57,6 +66,16 @@ jobs:
           print('metadata OK')
           PY
 
+      - name: Reject stale custom-rule Python files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find Coyote/custom_rules -type f -name '*.py' -print -quit 2>/dev/null | grep -q .; then
+            echo 'Python custom-rule files are no longer supported.' >&2
+            exit 1
+          fi
+          test ! -e 'Coyote/src/Coyote/md/自定义规则开发指南.md'
+
       - name: Reject release-template placeholders
         shell: bash
         run: |
@@ -67,9 +86,7 @@ jobs:
 
       - name: Verify nested license is GPL-3.0
         shell: bash
-        run: |
-          set -euo pipefail
-          cmp LICENSE Coyote/LICENSE
+        run: cmp LICENSE Coyote/LICENSE
 
       - name: Verify vendored DG-LAB license is retained
         shell: bash

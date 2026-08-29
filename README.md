@@ -1,51 +1,66 @@
 # Coyote — PEAK × DG-LAB Integration
 
-> PEAK 游戏遥测、规则系统与 DG-LAB 控制的非官方社区集成项目。
+> PEAK 游戏遥测、图形化规则与 DG-LAB 控制的非官方社区集成项目。
 
-Coyote 由 **PEAK/BepInEx 遥测插件**和**Windows 桌面控制端**组成，可把游戏状态转换为经过配置和安全限制的 DG-LAB A/B 通道输出，并支持多人设备绑定、规则扩展、直连以及公网 WSS 中继。
+Coyote 由 **PEAK/BepInEx 遥测插件**和 **Windows 桌面控制端**组成。插件读取本地/多人游戏状态，桌面端负责规则判断、设备路由、A/B 通道输出、网络模式和图形化自定义规则。
 
 > [!IMPORTANT]
-> 本项目与 PEAK、DG-LAB、BepInEx 官方均无隶属或背书关系。文档中的“项目预设中继”（内部历史标识 `official_relay`）指 **Coyote 项目预配置的 Relay 地址**，不是 DG-LAB 官方运营服务。许可证、上游来源和第三方边界见 [NOTICE.md](NOTICE.md)。
+> 本项目与 PEAK、DG-LAB、BepInEx 官方均无隶属或背书关系。代码中的 `official_relay` 只是 Coyote 项目预配置的 Relay 标识，不代表 DG-LAB 官方运营服务。第三方边界见 [NOTICE.md](NOTICE.md)。
 
-## 项目结构
+## 代码结构
 
-从**仓库根目录**看，主要文件位于：
+重构后的源码按职责分层：
 
-| 模块 | 实际路径 | 作用 |
-| --- | --- | --- |
-| PEAK 插件 | `Coyote/src/Coyote/Plugin.cs` | 读取本地玩家状态并发送遥测 |
-| 多人遥测 | `Coyote/src/Coyote/MultiplayerTelemetry.cs` | 读取联机玩家、血量、状态、位置与距离 |
-| 桌面入口 | `Coyote/src/Coyote/main.py` | 按固定顺序安装后端/UI 扩展并启动程序 |
-| 桌面后端 | `Coyote/src/Coyote/backend.py` | 规则、配置、日志、DG-LAB 操作与安全限制 |
-| 扩展规则 | `Coyote/src/Coyote/extended_features.py` | 恢复、区域、随机波形、HP 渐升等 |
-| 多人系统 | `Coyote/src/Coyote/multiplayer_features.py` | 多 APP/设备、玩家绑定、远程输出 |
-| 网络扩展 | `Coyote/src/Coyote/network_features.py` | 直连、项目预设 WSS、自定义 WSS |
-| Relay 诊断 | `Coyote/src/Coyote/remote_reporting.py` | 可选的状态/日志上报与隐私控制 |
-| 桌面 UI | `Coyote/src/Coyote/ui_qt.py` | 参数配置、状态展示、日志和设备管理 |
-| 自动更新 | `Coyote/src/Coyote/update_checker.py` | GitHub Release 检查与便携版更新 |
-| 自定义规则 | `Coyote/custom_rules/` | 用户自定义 Python 规则 |
-| 本地 V4 Server | `Coyote/dglab-websocket-server-main/` | 上游派生/兼容的 DG-LAB WebSocket 服务 |
+```text
+Coyote/src/Coyote/
+├─ main.py                         # 极薄启动入口
+├─ backend.py                      # 稳定核心：状态/规则/设备/配置/路径
+├─ i18n.py                         # 稳定语言资源定位
+├─ update_checker.py               # 稳定更新器/安装目录定位
+├─ app_version.py                  # 桌面版本号
+├─ relay_config.py                 # 项目预设 Relay 身份
+├─ Plugin/
+│  └─ CoyotePlugin.cs              # PEAK/BepInEx 主插件
+├─ Telemetry/
+│  └─ MultiplayerTelemetry.cs      # 多人遥测
+├─ coyote_app/
+│  ├─ bootstrap.py                 # 唯一应用组合根/安装顺序
+│  ├─ features/
+│  │  ├─ extended.py               # 恢复/区域/随机波形/渐升
+│  │  ├─ multiplayer.py            # 多人/多设备路由
+│  │  ├─ network.py                # 直连/WSS 网络模式
+│  │  └─ reporting.py              # 可选加密诊断上报
+│  ├─ ui/
+│  │  └─ qt.py                     # PySide6 桌面 UI
+│  └─ visual_rules/
+│     ├─ engine.py                 # 节点图存储/执行/编辑器
+│     ├─ integration.py            # 现有检测器与输出能力适配
+│     └─ policy.py                 # 官方规则/自定义规则分域策略
+├─ language/                       # 运行时语言资源
+└─ md/                             # 随便携包发布的用户文档
+```
 
-更详细的代码边界和扩展安装顺序见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+历史模块名 `ui_qt.py`、`extended_features.py`、`visual_rules.py` 等仍保留，但现在只是**兼容别名**；实现只维护在 `coyote_app/` 中。`backend.py`、`i18n.py`、`update_checker.py` 等依赖自身文件位置计算资源/安装路径，因此刻意保留稳定位置，避免重构破坏现有便携版和用户配置。
+
+完整边界与依赖方向见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 数据链路
 
 ```text
 PEAK
-  │
-  │ BepInEx / Coyote.dll
-  │ 本地遥测
+  │  Coyote.dll / BepInEx
   ▼
 Coyote Desktop
-  ├─ 状态归一化
-  ├─ 规则与冷却
-  ├─ 安全总开关 / 强度限制
-  ├─ 玩家 → 设备绑定
-  └─ A/B 波形与强度控制
+  ├─ 遥测归一化
+  ├─ 官方规则域
+  ├─ 图形化自定义规则域
+  ├─ 多人玩家 → 设备绑定
+  ├─ 总输出/强度硬上限/停止控制
+  └─ A/B 强度、持续时间与波形
   │
   ├───────────────┐
   ▼               ▼
-本地直连       WSS Relay
+本机直连       WSS Relay
   │               │
   └───────┬───────┘
           ▼
@@ -55,91 +70,57 @@ Coyote Desktop
      DG-LAB Device
 ```
 
-## 主要功能
+## 图形化自定义规则
 
-### PEAK 遥测
+用户不再编写或加载 Python 自定义规则。自定义规则由软件中的 **模块 + 端口 + 连线** 编辑器创建，持久化为：
 
-可处理的状态包括血量、体力、死亡、昏迷、跳跃、攀爬、蹲下、移动速度、物品、背包、场景、位置以及多种异常状态。多人扩展还可读取联机玩家、远程玩家血量/状态/位置和距离。
+```text
+Coyote/visual_rules.json
+```
 
-### 规则系统
+节点库包含当前软件已注册的规则事件、遥测字段、比较/逻辑、边沿、冷却、强度、持续时间、波形、档位、随机波形、输出以及自定义死亡/昏迷保护模块。
 
-规则可配置：
+`禁用软件内置规则` 是整个官方自动规则域的接管开关。它生效后，官方普通规则、官方死亡/昏迷输出以及官方死亡/昏迷规则级保护都不再参与；自定义规则需要什么死亡/昏迷保护，由自定义节点图自己显式连接对应保护模块。
 
-- A/B 通道强度；
-- A/B 持续时间；
-- 通道波形；
-- 最大强度；
-- 冷却时间；
-- 随机强度；
-- 百分比阶梯；
-- 瞬时变化增强；
-- 持续输出；
-- 区域、恢复、物品和状态类扩展条件。
+详细使用方法见 `Coyote/src/Coyote/md/图形化规则使用说明.md`。
 
-持续模式由桌面端以有限片段续播，不把“无限任务”直接交给设备，以便在关闭输出、断连、角色状态变化或程序退出时停止。
+## 官方规则与自定义规则
 
-### 多人设备映射
+两套规则系统逻辑上独立：
 
-同一个 Controller 可管理多个 DG-LAB App/设备。设备身份按 `client_id + slot_id` 区分；远程 PEAK 玩家可在当前会话中绑定指定设备。
+- **官方规则域**：官方规则页面中的规则与其官方保护逻辑；
+- **自定义规则域**：`visual_rules.json` 中的图形规则；
+- 两者共享 DG-LAB 连接、设备 slot、总输出开关、强度硬上限、主动停止/断开等底层设施；
+- 自定义死亡/昏迷图不会自动覆盖官方死亡/昏迷规则；
+- 禁用官方规则后，不会残留官方死亡/昏迷保护替自定义规则做决定。
 
-远程自动输出必须同时满足总输出开关、多人远程输出开关、玩家输出开关、有效绑定以及目标设备在线等条件。
+## 多人与设备路由
 
-### 波形
-
-项目包含气泡、挤压、攀登、树荫、律动、电波、舞步、呼吸、脉冲等预设，并支持自定义波形和 A/B 独立选择。
+同一个 Controller 可以识别多个 DG-LAB App/Slot。设备身份按 `client_id + slot_id` 区分，远程 PEAK 玩家可在当前会话中绑定指定设备。远程自动输出有独立开关，且绑定默认不永久保存。
 
 ## 网络模式
 
-### 1. 直连
+桌面端提供三种明确模式：
 
-默认模式。Coyote Controller 连接本机 Bun WebSocket Server，DG-LAB App 使用可到达该电脑的局域网、VPN、IPv4、IPv6 或手动域名/IP 地址连接。
+1. **直连**：Coyote Controller 使用本机 Bun WebSocket Server，手机通过局域网/VPN/IPv4/IPv6/手动地址访问电脑；
+2. **项目预设 WSS Relay**：用户主动选择 Coyote 项目预配置的加密中继；
+3. **自定义 WSS Relay**：使用独立部署的兼容 Relay。
 
-```text
-Coyote -> 127.0.0.1:Relay
-Phone  -> ws://可到达的电脑地址:Relay/?tid=...
-```
-
-### 2. 项目预设 WSS 中继
-
-当电脑和手机不能直接互访时，可显式选择 Coyote 项目预配置的公网 WSS Relay。
-
-内部配置/历史代码标识为 `official_relay`，这里的 “official” **仅表示 Coyote 项目内置预设**，不表示 DG-LAB 官方服务。
-
-### 3. 自定义 WSS 中继
-
-可使用独立部署的 [`PEAK_Coyote_Relay`](https://github.com/sunzhaocn/PEAK_Coyote_Relay) 或其他兼容服务。公网自定义中继必须使用 `wss://`。
-
-网络模式不会在直连失败后静默切换到公网中继；公网 Relay 由用户主动选择。
+直连失败不会静默切换到公网 Relay。公网/自定义 Relay 必须使用 `wss://`。
 
 ## 普通用户安装
 
-推荐从 GitHub Releases 下载 Windows 便携包，例如：
+推荐直接从 GitHub Releases 下载：
 
 ```text
 Coyote_Windows_x64_Portable.zip
 ```
 
-典型流程：
-
-1. 解压便携包并启动 `Coyote.exe`；
-2. 让程序检测 PEAK 安装路径；
-3. 检查/安装/修复 BepInEx；
-4. 安装或更新 `Coyote.dll`；
-5. 启动 PEAK；
-6. 确认游戏遥测已连接；
-7. 连接 DG-LAB App；
-8. 先用低强度手动测试；
-9. 再开启总输出和所需自动规则。
-
-首次使用不要直接启用高强度、长持续时间或多人远程自动输出。
+典型流程：解压 → 启动 `Coyote.exe` → 检测/安装 PEAK BepInEx → 安装 `Coyote.dll` → 启动 PEAK → 连接 DG-LAB App → 先低强度测试 → 再开启所需规则。
 
 ## 源码运行与构建
 
-Python 依赖位于：
-
-```text
-Coyote/requirements.txt
-```
+Python 依赖：`Coyote/requirements.txt`
 
 源码入口：
 
@@ -147,74 +128,54 @@ Coyote/requirements.txt
 Coyote/src/Coyote/main.py
 ```
 
-Windows 便携版构建入口：
+Windows 便携构建：
 
 ```text
 Coyote/build_exe_selfcontained.bat
 Coyote/build_exe_selfcontained.ps1
 ```
 
-构建脚本会编译当前 `Coyote.csproj`、运行 Python 语法检查、执行 PyInstaller，并复制运行资源和当前生成的 `Coyote.dll`。
+构建脚本会：
 
-Thunderstore 打包在仓库源码中默认关闭；维护者需要发布时应在本机 `Coyote/Config.Build.user.props` 配置维护者/团队信息，并显式启用打包。该本机配置已被 `.gitignore` 排除。
+1. 校验仓库结构；
+2. 编译当前 `Coyote.csproj`；
+3. 递归编译 Python 源码；
+4. 运行测试（若存在）；
+5. 构建 PyInstaller 桌面程序；
+6. 复制语言、文档、Relay Server、项目预设 Relay 配置和最新 `Coyote.dll`；
+7. 生成 Windows x64 Portable ZIP。
 
-## 版本号
+## 版本域
 
-仓库中存在多个独立版本域，**不要因为数字不同就直接同步覆盖**：
+以下版本彼此独立，不要因为数字不同就机械同步：
 
 - 桌面程序 / GitHub Release：`Coyote/src/Coyote/app_version.py`
 - BepInEx 插件：`Coyote/src/Coyote/Coyote.csproj`
-- 网络/多人模块中的 `V2.6.x`：模块实现修订标识
-- `PEAK_Coyote_Relay`：独立仓库、独立版本生命周期
+- 网络/多人模块中的实现修订号
+- 独立 Relay 项目版本
 
 详见 [docs/VERSIONING.md](docs/VERSIONING.md)。
 
-## 自定义规则
-
-用户规则放在：
-
-```text
-Coyote/custom_rules/
-```
-
-规则通过后端提供的受限接口读取状态并描述输出。加载器会进行 AST 校验并限制内置能力，但这属于**应用级约束，不是操作系统沙箱**。只加载可信的规则文件。
-
-开发规则前请参考 `Coyote/src/Coyote/md/自定义规则开发指南.md`。
-
-## 安全设计
-
-Coyote 的默认设计包括：
-
-- 自动规则默认关闭；
-- 多人远程输出默认关闭；
-- 独立总输出开关；
-- 全局强度上限；
-- 设备断线不自动切换到其他设备；
-- 玩家绑定默认是会话级；
-- 死亡/昏迷、场景切换等状态下进行输出保护；
-- 持续模式使用有限片段续播；
-- 程序退出时清理任务；
-- 公网/自定义 Relay 要求 `wss://`。
-
-软件保护不能替代设备本身的安全限制或物理断开方式。安全与漏洞报告说明见 [SECURITY.md](SECURITY.md)。
-
-## 上游和许可证
-
-本项目以 **GPL-3.0** 发布。
-
-`Coyote/dglab-websocket-server-main/` 是独立的上游派生/兼容源码子树，保留其 GPL 许可证。当前仓库不宣称该目录与 DG-LAB 上游仓库 `main` 分支逐字同步；更新该目录时必须保留许可证并记录选择的上游版本/修订。
-
-详见 [NOTICE.md](NOTICE.md)。
-
 ## 开发检查
 
-仓库 CI 会执行：
+CI 会检查：
 
-- Python 源码编译检查；
-- 语言/Relay 配置 JSON 解析；
-- MSBuild XML 元数据解析；
-- 模板 TODO 残留检查；
-- 根目录与 `Coyote/` GPL 许可证一致性检查；
-- 上游 DG-LAB 子树许可证存在性检查。
+- 新目录结构和兼容层；
+- 不允许重新出现 Python 自定义规则文件；
+- 全部 Python 源码语法；
+- JSON/XML 元数据；
+- 发布模板残留；
+- GPL 许可证一致性；
+- vendored DG-LAB Server 许可证保留。
 
-贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+本地可先运行：
+
+```bash
+python Coyote/tools/validate_structure.py
+```
+
+贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 许可证
+
+项目以 **GPL-3.0** 发布。`Coyote/dglab-websocket-server-main/` 是独立的上游派生/兼容源码子树，保留其许可证和第三方边界。
