@@ -4,6 +4,7 @@ import network_features as NET
 import remote_reporting as REPORT
 import update_checker as UPDATE
 import visual_rules as VIS
+import visual_rules_hardening as VIS_HARDENING
 
 # Backend hooks must be installed before ui_qt.main() starts worker threads.
 # Visual rules are installed last so their event bridge sees the final rule set
@@ -13,6 +14,7 @@ MP.install_backend()
 NET.install_backend()
 REPORT.install_backend()
 VIS.install_backend()
+VIS_HARDENING.install()
 
 import ui_qt
 
