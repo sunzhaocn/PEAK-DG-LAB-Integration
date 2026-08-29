@@ -17,6 +17,7 @@ from coyote_app.visual_rules import engine as VIS
 from coyote_app.visual_rules import integration as VIS_INTEGRATION
 from coyote_app.visual_rules import policy as VIS_POLICY
 from coyote_app.visual_rules import usability as VIS_USABILITY
+from coyote_app.visual_rules import node_ui as VIS_NODE_UI
 import update_checker as UPDATE
 
 
@@ -53,6 +54,7 @@ def install_ui_extensions(ui_module) -> None:
         VIS_INTEGRATION.install_ui,
         VIS_POLICY.install_ui,
         VIS_USABILITY.install_ui,
+        VIS_NODE_UI.install_ui,
         APP_ICON.install_ui,
     )
     for installer in installers:
