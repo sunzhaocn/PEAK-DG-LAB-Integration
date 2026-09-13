@@ -7,19 +7,18 @@ belong to the existing rule detectors.
 Key guarantees:
 
 1. Every enabled graph is evaluated for the same telemetry packet.
-2. Death and passed-out graphs are isolated privileged domains.
-3. ``disable_builtin`` suppresses ordinary built-in device output but does not
-   starve visual event nodes of the existing event detectors.
+2. Death and passed-out graphs keep their dedicated graph topology.
+3. Visual event detection is independent of built-in enable flags and output.
 4. Detector parameters (speed threshold, item filter, recovery threshold, area
    definitions, etc.) travel with visual trigger nodes instead of requiring the
-   old rule to stay enabled.
+   old rule to stay enabled. Each trigger node owns its detection state.
 5. The existing HP intensity-ramp feature is available from the visual intensity
    node and reuses extended_features.py's already-tested ramp worker.
 6. Repeat/continuous graphs use Coyote's effective cooldown calculation.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+import time
 
 import backend as B
 import extended_features as EXT
@@ -28,7 +27,6 @@ import visual_rules as V
 _INSTALLED = False
 _UI_INSTALLED = False
 _ORIGINAL_VALIDATE = None
-_MISSING = object()
 _SPECIAL_TYPES = {"death", "passed"}
 _SPECIAL_ALLOWED = {
     "death",
@@ -45,8 +43,8 @@ _SPECIAL_ALLOWED = {
     "comment",
 }
 
-# Fields that affect whether/when the current built-in event detector emits an
-# event. Output-only fields deliberately do not belong here.
+# Fields shared with the built-in detector UI. Runtime visual detection reads
+# only node parameters; output-only fields deliberately do not belong here.
 _DETECTOR_FIELDS = {
     "staminaUse": ("trigger_delta",),
     "speedBelow": ("speed_threshold",),
@@ -132,79 +130,147 @@ def _trigger_defaults(key):
         }
 
 
-def _enabled_trigger_specs():
-    """Return rule_key -> visual detector parameters for enabled valid graphs.
+def _detect_visual_trigger(graph, node, current, previous):
+    """Detect an event using this node's settings and private runtime only.
 
-    The first enabled node for a key owns the detector configuration for that
-    telemetry dispatch. Users can still build multiple branches from that event.
+    A visual event is not a successful built-in device send. In particular,
+    single recovery/dwell events are consumed when detected, even if built-ins
+    are disabled or a downstream visual condition prevents output.
     """
-    snapshot, good = _snapshot_graphs()
-    result = {}
-    for graph in snapshot:
-        if not graph.get("enabled") or graph.get("id") not in good:
+    # Discard deltas across rebuilt characters/scenes, just as the built-in
+    # event detectors do. This is not an incapacitation lock: events during a
+    # stable dead/passed-out state remain available to custom graphs.
+    transition = EXT._packet_transition_reason(current, previous)
+    guarded = (
+        EXT.extension_settings.get("respawn_guard_enabled", True)
+        and time.monotonic() < EXT._RESPAWN_GUARD_UNTIL
+    )
+    if transition or guarded:
+        with V._RUNTIME_LOCK:
+            V._rt(graph["id"], node["id"]).clear()
+        return False
+    params = node.get("params", {})
+    key = str(params.get("rule_key") or "").strip()
+    defaults = {
+        "trigger_delta": 1.0,
+        "speed_threshold": 5.0 if key == "speedAbove" else 1.0,
+        "item_filter": "",
+        "trigger_mode": "single",
+        "area_zones": [],
+        "area_dwell_seconds": 30.0,
+    }
+    cfg = {
+        field: _normalise_detector_value(key, field, params.get(field, defaults[field]))
+        for field in _DETECTOR_FIELDS.get(key, ())
+    }
+    with V._RUNTIME_LOCK:
+        state = V._rt(graph["id"], node["id"])
+        identity = {"rule_key": key, **cfg}
+        if state.get("detector_config") != identity:
+            state.clear()
+            state["detector_config"] = V._copy(identity)
+        return _detect_visual_event(key, cfg, state, current, previous)
+
+
+def _detect_visual_event(key, cfg, state, current, previous):
+    """Pure telemetry predicates; shared helpers preserve built-in field units."""
+    if key == "hp":
+        return round(V._num(current.get("hp", 100)), 1) < round(V._num(previous.get("hp", 100)), 1)
+    if key == "staminaUse":
+        return B.stamina_percent(previous) - B.stamina_percent(current) >= cfg["trigger_delta"]
+    if key in {"speedBelow", "speedAbove"}:
+        old, new = B.packet_speed(previous), B.packet_speed(current)
+        threshold = cfg["speed_threshold"]
+        return old >= threshold > new if key == "speedBelow" else old <= threshold < new
+    if key == "jump":
+        return (
+            V._num(current.get("jumpSeq")) > V._num(previous.get("jumpSeq"))
+            or (
+                "jumpSeq" not in current
+                and bool(previous.get("grounded", False))
+                and not bool(current.get("grounded", False))
+                and B.velocity_y(current) > 0.35
+            )
+        )
+    if key in {"climbStart", "crouchStart"}:
+        field = "climbing" if key == "climbStart" else "crouching"
+        return bool(current.get(field, False)) and not bool(previous.get(field, False))
+    if key == "heldItem":
+        old = str((previous.get("heldItem") or {}).get("name", "") or "").strip()
+        new = str((current.get("heldItem") or {}).get("name", "") or "").strip()
+        return new != old and B.item_rule_matches(cfg, new)
+    if key == "backpackItem":
+        old = (previous.get("inventory") or {}).get("backpackItems", [])
+        new = (current.get("inventory") or {}).get("backpackItems", [])
+        return any(B.item_rule_matches(cfg, item) for item in B.list_added_items(old, new))
+    if key in {"heldState", "backpackState"}:
+        matcher = B.current_held_match if key == "heldState" else B.current_backpack_matches
+        return matcher(current, cfg)[0] and not matcher(previous, cfg)[0]
+    if key == "consumedItem":
+        new_id = EXT._event_id(current, "lastConsumedItem")
+        item = str((current.get("lastConsumedItem") or {}).get("item", "") or "").strip()
+        return bool(new_id and new_id != EXT._event_id(previous, "lastConsumedItem")) and (
+            not item or B.item_rule_matches(cfg, item)
+        )
+    if key in {"hpRecover", "staminaRecover"}:
+        getter = (lambda packet: V._num(packet.get("hp", 100))) if key == "hpRecover" else B.stamina_percent
+        old, new = getter(previous), getter(current)
+        if new <= old + 1e-4:
+            state.update(start=None, fired=False)
+            return False
+        if state.get("start") is None:
+            state.update(start=old, fired=False)
+        if new - state["start"] + 1e-6 < cfg["trigger_delta"]:
+            return False
+        if cfg["trigger_mode"] == "single" and state.get("fired", False):
+            return False
+        state["fired"] = True
+        return True
+    if key == "statusRecover":
+        names = current.get("statusNames") or [name for name, _ in B.STATUS_ORDER]
+        for index, name in enumerate(names):
+            old = B.status_percent_for_rule(previous, name, index)
+            new = B.status_percent_for_rule(current, name, index)
+            if old is not None and new is not None and old - new + 1e-6 >= cfg["trigger_delta"]:
+                return True
+        return False
+    if key in {"areaEnter", "areaDwell"}:
+        return _detect_visual_area(key, cfg, state, current)
+    for rule_key, _, index, _ in B.RULE_META:
+        if key == rule_key and index is not None:
+            old = B.status_percent_for_rule(previous, key, index)
+            new = B.status_percent_for_rule(current, key, index)
+            return old is not None and new is not None and new > old
+    return False
+
+
+def _detect_visual_area(key, cfg, state, current):
+    position = EXT._packet_position(current)
+    if position is None:
+        return False
+    scene = str(current.get("scene", "") or "").lower()
+    now = time.monotonic()
+    zones = state.setdefault("zones", {})
+    detected = False
+    for index, zone in enumerate(cfg["area_zones"]):
+        scene_filter = zone["scene"].lower()
+        inside = (not scene_filter or scene_filter in scene) and sum(
+            (position[axis] - zone[name]) ** 2 for axis, name in enumerate(("x", "y", "z"))
+        ) <= zone["radius"] ** 2
+        zone_state = zones.setdefault(index, {"inside": False, "entered_at": None, "fired": False})
+        was_inside = zone_state["inside"]
+        if not inside:
+            zone_state.update(inside=False, entered_at=None, fired=False)
             continue
-        for node in graph.get("nodes", []):
-            if node.get("type") != "trigger":
-                continue
-            params = node.get("params") if isinstance(node.get("params"), dict) else {}
-            key = str(params.get("rule_key") or "").strip()
-            if not key or key in V._SPECIAL_KEYS or key not in getattr(B, "rules", {}):
-                continue
-            if key in result:
-                continue
-            merged = _trigger_defaults(key)
-            for field in _DETECTOR_FIELDS.get(key, ()):
-                if field in params:
-                    merged[field] = _normalise_detector_value(key, field, params.get(field))
-            result[key] = merged
-    return result
-
-
-@contextmanager
-def _temporarily_enable_visual_event_detectors():
-    """Run subscribed built-in detectors as detector-only when takeover is active.
-
-    V.install_backend() records the event key before its ``disable_builtin`` gate
-    and returns before device I/O. Temporarily enabling and parameterising these
-    detector entries therefore cannot resurrect ordinary built-in stimulation.
-    All mutated fields are restored in ``finally`` after the current telemetry
-    packet finishes.
-    """
-    if not V.builtins_disabled():
-        yield
-        return
-
-    specs = _enabled_trigger_specs()
-    if not specs:
-        yield
-        return
-
-    saved = {}
-    with B.rule_lock:
-        for key, params in specs.items():
-            cfg = B.rules.get(key)
-            if not isinstance(cfg, dict):
-                continue
-            snapshot = {"enabled": cfg.get("enabled", _MISSING)}
-            cfg["enabled"] = True
-            for field, value in params.items():
-                snapshot[field] = cfg.get(field, _MISSING)
-                cfg[field] = V._copy(value)
-            saved[key] = snapshot
-
-    try:
-        yield
-    finally:
-        with B.rule_lock:
-            for key, snapshot in saved.items():
-                cfg = B.rules.get(key)
-                if not isinstance(cfg, dict):
-                    continue
-                for field, value in snapshot.items():
-                    if value is _MISSING:
-                        cfg.pop(field, None)
-                    else:
-                        cfg[field] = value
+        if not was_inside:
+            zone_state.update(inside=True, entered_at=now, fired=False)
+        if key == "areaEnter":
+            detected = not was_inside or detected
+        elif now - zone_state["entered_at"] + 1e-6 >= cfg["area_dwell_seconds"]:
+            if cfg["trigger_mode"] == "repeat" or not zone_state["fired"]:
+                zone_state["fired"] = True
+                detected = True
+    return detected
 
 
 def _strict_validate_graph(graph):
@@ -260,6 +326,7 @@ def install():
 
     _ORIGINAL_VALIDATE = V.validate_graph
     V.validate_graph = _strict_validate_graph
+    V.detect_trigger = _detect_visual_trigger
     B.validate_visual_graph = _strict_validate_graph
 
     def evaluate_all(current, previous, privileged=False):
@@ -339,14 +406,6 @@ def install():
                 EXT._RAMP_CONTEXT.value = None
 
     V._send_graph = send_graph
-
-    visual_handle_game_rules = B.handle_game_rules
-
-    def handle_game_rules(current, previous):
-        with _temporarily_enable_visual_event_detectors():
-            return visual_handle_game_rules(current, previous)
-
-    B.handle_game_rules = handle_game_rules
 
     B.COYOTE_VISUAL_RULES_HARDENING = 3
 

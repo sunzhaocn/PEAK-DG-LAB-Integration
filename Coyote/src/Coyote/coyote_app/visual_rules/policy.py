@@ -64,6 +64,11 @@ def _eval_separated(graph, node_id, current, previous, cache, stack):
 
 
 def _send_visual_graph(graph, output_node, cfg, pool, value, delta, privileged):
+    with B.output_context():
+        return _send_visual_graph_output(graph, output_node, cfg, pool, value, delta, privileged)
+
+
+def _send_visual_graph_output(graph, output_node, cfg, pool, value, delta, privileged):
     """Send visual output without consulting the built-in incapacitation lock."""
     cfg = V._copy(cfg)
     params = output_node.get("params", {}) if isinstance(output_node, dict) else {}
@@ -303,6 +308,11 @@ def _evaluate_all_visual(current, previous, privileged=False):
 
 
 def _send_builtin_special(key, name, detail):
+    with B.output_context():
+        return _send_builtin_special_output(key, name, detail)
+
+
+def _send_builtin_special_output(key, name, detail):
     """Built-in death/passed-out fallback, independent from custom graphs."""
     if V.builtins_disabled():
         return False
@@ -375,7 +385,7 @@ def _send_builtin_special(key, name, detail):
     return success
 
 
-def _clear_device_output_separated(reason=""):
+def _clear_device_output_separated(reason="", *, local_only=False):
     """Do not apply the built-in incapacity clear while built-ins are disabled."""
     text = str(reason or "")
     is_builtin_incapacity_clear = (
@@ -393,7 +403,7 @@ def _clear_device_output_separated(reason=""):
             "禁用软件内置规则生效：不清除自定义图形规则输出。",
         )
         return True
-    return _ORIGINAL_CLEAR_DEVICE_OUTPUT(reason)
+    return _ORIGINAL_CLEAR_DEVICE_OUTPUT(reason, local_only=local_only)
 
 
 def install():

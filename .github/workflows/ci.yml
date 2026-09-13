@@ -28,7 +28,7 @@ jobs:
           from pathlib import Path
           import py_compile
 
-          roots = [Path('Coyote/src/Coyote'), Path('Coyote/tools')]
+          roots = [Path('Coyote/src/Coyote'), Path('Coyote/tools'), Path('Coyote/tests')]
           files = sorted(
               path
               for root in roots
@@ -42,6 +42,14 @@ jobs:
               py_compile.compile(str(path), doraise=True)
           print(f'compiled {len(files)} Python files')
           PY
+
+      - name: Install desktop dependencies for offline regression tests
+        run: python -m pip install -r Coyote/requirements.txt
+
+      - name: Run offline regression tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s Coyote/tests -v
 
       - name: Validate JSON and XML metadata
         shell: bash

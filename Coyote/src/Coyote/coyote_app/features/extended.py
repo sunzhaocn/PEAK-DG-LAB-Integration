@@ -509,6 +509,9 @@ def install_backend():
             steps = _clamp_int(ctx.get("ramp_steps", 10), 2, 100, 10)
             generation = int(ctx.get("generation", 0))
             slot_id = data.get("s")
+            # Keep the originating event's cancellation/connection identity
+            # when this work moves to a background thread.
+            output_token = B.current_output_token() or B.capture_output_token()
 
             threading.Thread(
                 target=_ramp_worker,
@@ -521,6 +524,7 @@ def install_backend():
                     duration_ms,
                     ramp_ms,
                     steps,
+                    output_token,
                 ),
                 name=f"CoyoteDamageRamp-{channel}",
                 daemon=True,
@@ -641,11 +645,12 @@ def install_backend():
 
     original_clear_output = B.clear_device_output
 
-    def extended_clear_device_output(reason="手动停止"):
+    def extended_clear_device_output(reason="手动停止", *, local_only=False):
         global _RAMP_GENERATION
-        with _RAMP_LOCK:
-            _RAMP_GENERATION += 1
-        return original_clear_output(reason)
+        with B.ws_send_lock:
+            with _RAMP_LOCK:
+                _RAMP_GENERATION += 1
+            return original_clear_output(reason, local_only=local_only)
 
     B.clear_device_output = extended_clear_device_output
 
@@ -730,22 +735,37 @@ def _ramp_worker(
     duration_ms,
     ramp_ms,
     steps,
+    output_token,
 ):
     if not slot_id:
         return
 
-    # Start at zero explicitly, then climb in evenly spaced absolute levels.
-    original_send_rpc(
-        "device.op",
-        {
-            "s": slot_id,
-            "c": channel,
-            "t": 4,
-            "v": 0,
-            "d": duration_ms,
-            "im": True,
-        },
-    )
+    def send_level(level, duration):
+        with B.ws_send_lock:
+            with _RAMP_LOCK:
+                if generation != _RAMP_GENERATION:
+                    return False
+            if not bool(getattr(B, "master_output_enabled", False)):
+                return False
+            if B.get_slot_id() != slot_id:
+                return False
+            try:
+                if B.peak_is_incapacitated():
+                    return False
+            except Exception:
+                return False
+            # Transport checks the captured client, slot, socket and generation
+            # under this same lock, so switching away/back cannot revive a ramp.
+            with B.output_context(output_token):
+                ok, _message = original_send_rpc(
+                    "device.op",
+                    {"s": slot_id, "c": channel, "t": 4, "v": level,
+                     "d": duration, "im": True},
+                )
+            return bool(ok)
+
+    if not send_level(0, duration_ms):
+        return
 
     start = time.monotonic()
     step_interval = ramp_ms / max(1, steps) / 1000.0
@@ -759,20 +779,6 @@ def _ramp_worker(
                 break
             time.sleep(min(0.03, remaining))
 
-        with _RAMP_LOCK:
-            if generation != _RAMP_GENERATION:
-                return
-
-        if not bool(getattr(B, "master_output_enabled", False)):
-            return
-        if B.get_slot_id() != slot_id:
-            return
-        try:
-            if B.peak_is_incapacitated():
-                return
-        except Exception:
-            return
-
         level = int(round(target * step / steps))
         level = max(0, min(target, level))
         if level == last_level and step != steps:
@@ -782,17 +788,8 @@ def _ramp_worker(
         elapsed_ms = int((time.monotonic() - start) * 1000)
         remaining_duration = max(100, duration_ms - elapsed_ms)
 
-        original_send_rpc(
-            "device.op",
-            {
-                "s": slot_id,
-                "c": channel,
-                "t": 4,
-                "v": level,
-                "d": remaining_duration,
-                "im": True,
-            },
-        )
+        if not send_level(level, remaining_duration):
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -1457,6 +1454,22 @@ def install_ui(UI):
             super().__init__()
             self._install_peakshock_hardening_panel()
 
+        def validate_imported_rules(self, incoming):
+            validated = super().validate_imported_rules(incoming)
+            fields = ("random_waveform", "random_waveforms") + RAMP_FIELDS + AREA_FIELDS
+            with B.rule_lock:
+                for key, cfg in validated.items():
+                    source = incoming.get(key)
+                    if not isinstance(source, dict):
+                        source = B.rules.get(key, {})
+                    for field in fields:
+                        if field in source:
+                            cfg[field] = source[field]
+                    # Reuse the loading/editor schema, including bounds and
+                    # pruning of fields that do not apply to this rule.
+                    _normalize_extension_rule_fields(key, cfg)
+            return validated
+
         def _install_peakshock_hardening_panel(self):
             layout = self.rules_tab.layout() if hasattr(self, "rules_tab") else None
             if layout is None:
@@ -1561,4 +1574,3 @@ def install_ui(UI):
     # Existing Window.set_all_rules_enabled() iterates every RuleEditor, so the
     # newly injected rules automatically support 全部开启 / 全部关闭. Nothing
     # else is required here.
-
