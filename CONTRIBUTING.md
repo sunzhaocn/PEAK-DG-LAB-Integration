@@ -70,4 +70,17 @@ PY
 On Windows, run `Coyote/build_exe_selfcontained.ps1` for the complete C# +
 PyInstaller portable build.
 
+Run the offline runtime regressions with the desktop dependencies installed:
+
+```bash
+python -m pip install -r Coyote/requirements.txt
+python -m unittest discover -s Coyote/tests -v
+```
+
+The tests install the real backend extensions in isolated processes, use temporary
+configuration directories, disable real network I/O and replace device transport
+with in-memory recorders. Qt tests use the offscreen platform. Add behavioral
+regressions for output cancellation, device routing and rule/configuration
+changes; do not use a real game or device connection in this test suite.
+
 Do not claim PEAK or DG-LAB hardware testing unless it was actually performed.

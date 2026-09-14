@@ -14,6 +14,9 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from urllib.parse import quote
 
@@ -484,7 +487,12 @@ dg_lock = threading.Lock()
 peak_lock = threading.Lock()
 rule_lock = threading.Lock()
 log_lock = threading.Lock()
-ws_send_lock = threading.Lock()
+# Stop, route changes, token validation and the actual socket write share this
+# lock. It is reentrant because a stop transaction sends its clear RPC inside it.
+ws_send_lock = threading.RLock()
+_output_generation = 0
+_local_output_generation = 0
+_output_context = threading.local()
 
 latest_peak = None
 previous_peak = None
@@ -532,6 +540,7 @@ manual_session = {
     "active": False,
     "a": None,
     "b": None,
+    "output_token": None,
 }
 
 # PEAK 进程检测缓存。
@@ -2990,32 +2999,142 @@ def websocket_loop():
 # 10. V4 发送接口
 # ============================================================
 
-def send_payload(payload):
-    with dg_lock:
-        ws = dg_ws
-        app_id = dg["app_id"]
+@dataclass(frozen=True)
+class OutputToken:
+    generation: int
+    local_generation: int
+    ws: object
+    client_id: object
+    slot_id: object
+    local_route: bool
+    require_master: bool
+    validator: object = None
 
-    if ws is None:
-        return False, "WebSocket 未连接"
 
-    if not app_id:
-        return False, "DG-LAB APP 未接入"
+def capture_output_token(*, client_id=None, slot_id=None, require_master=True, validator=None):
+    """Capture one output's lifetime and complete destination before any work.
+
+    Explicit client/slot IDs select an independent remote route. Optional
+    validators run under ws_send_lock, so callers must acquire that lock before
+    locks used by their validator when changing the corresponding state.
+    """
+    with ws_send_lock:
+        with dg_lock:
+            local_route = client_id is None
+            return OutputToken(
+                _output_generation,
+                _local_output_generation,
+                dg_ws,
+                dg["app_id"] if client_id is None else client_id,
+                dg["slot_id"] if slot_id is None else slot_id,
+                local_route,
+                bool(require_master),
+                validator,
+            )
+
+
+def current_output_token():
+    return getattr(_output_context, "token", None)
+
+
+def is_output_token_current(token):
+    """Check a captured output under the same lock that serializes socket writes."""
+    with ws_send_lock:
+        if not isinstance(token, OutputToken):
+            return False
+        if stop_event.is_set():
+            return False
+        if token.generation != _output_generation:
+            return False
+        if token.local_route and token.local_generation != _local_output_generation:
+            return False
+        if token.require_master and not master_output_enabled:
+            return False
+        with dg_lock:
+            if token.ws is None or token.ws is not dg_ws:
+                return False
+            if not token.client_id or not token.slot_id:
+                return False
+            if token.local_route and (
+                token.client_id != dg["app_id"] or token.slot_id != dg["slot_id"]
+            ):
+                return False
+        if token.validator is not None:
+            try:
+                if not token.validator():
+                    return False
+            except Exception:
+                return False
+        return True
+
+
+@contextmanager
+def output_context(token=None):
+    """Keep all RPCs of an output on one token; pass it explicitly to workers."""
+    previous = current_output_token()
+    if token is None:
+        token = previous if previous is not None else capture_output_token()
+    _output_context.token = token
+    try:
+        yield token
+    finally:
+        _output_context.token = previous
+
+
+def _output_operation(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with output_context():
+            return function(*args, **kwargs)
+    return wrapped
+
+
+def cancel_pending_output(*, local_only=False):
+    """Invalidate work already captured, without sending a device command."""
+    global _output_generation, _local_output_generation
+    with ws_send_lock:
+        if local_only:
+            _local_output_generation += 1
+        else:
+            _output_generation += 1
+
+
+def send_payload(payload, *, client_id=None, output_token=None):
+    is_output = isinstance(payload, dict) and payload.get("m") == "device.op"
+    token = output_token if output_token is not None else current_output_token()
+    if is_output and token is None:
+        data = payload.get("data") or {}
+        token = capture_output_token(client_id=client_id, slot_id=data.get("s"))
 
     try:
-        packet = json.dumps(
-            {
-                "type": "message",
-                "clientId": app_id,
-                "data": payload,
-            },
-            ensure_ascii=False,
-        )
-
         with ws_send_lock:
+            with dg_lock:
+                ws = dg_ws
+                app_id = dg["app_id"] if client_id is None else client_id
+
+            if ws is None:
+                return False, "WebSocket 未连接"
+            if not app_id:
+                return False, "DG-LAB APP 未接入"
+
+            if is_output:
+                data = payload.get("data") or {}
+                if (
+                    not is_output_token_current(token)
+                    or token.client_id != app_id
+                    or token.slot_id != data.get("s")
+                ):
+                    return False, "输出已取消或设备连接已改变"
+                # The token pins the WebSocket and both routing identifiers.
+                ws, app_id = token.ws, token.client_id
+
+            packet = json.dumps(
+                {"type": "message", "clientId": app_id, "data": payload},
+                ensure_ascii=False,
+            )
             ws.send(packet)
 
         return True, "已发送"
-
     except Exception as e:
         add_log("错误", "发送失败", str(e))
         return False, str(e)
@@ -3039,26 +3158,17 @@ def get_slot_id():
         return dg["slot_id"]
 
 
-def clear_device_output(reason="手动停止"):
-    # 任意全局清除动作都会终止手动 -1 持续会话。
-    with manual_session_lock:
-        manual_session["generation"] += 1
-        manual_session["active"] = False
-        manual_session["a"] = None
-        manual_session["b"] = None
-
-    slot_id = get_slot_id()
-
-    if not slot_id:
-        add_log("输出", "停止输出", "没有检测到郊狼设备")
-        return False, "没有检测到郊狼设备"
-
-    ok, message = send_rpc(
-        "device.op.clear",
-        {
-            "s": slot_id
-        }
-    )
+def clear_device_output(reason="手动停止", *, local_only=False):
+    # A completed stop is a barrier: work captured before it cannot send later,
+    # even if the user turns the master switch back on immediately.
+    with ws_send_lock:
+        cancel_pending_output(local_only=local_only)
+        stop_manual_continuous(clear_device=False)
+        slot_id = get_slot_id()
+        if not slot_id:
+            add_log("输出", "停止输出", "没有检测到郊狼设备")
+            return False, "没有检测到郊狼设备"
+        ok, message = send_rpc("device.op.clear", {"s": slot_id})
 
     add_log(
         "输出",
@@ -3326,6 +3436,7 @@ def _manual_payload(
     }
 
 
+@_output_operation
 def _send_manual_payload_once(
     payload,
 ):
@@ -3476,16 +3587,18 @@ def stop_manual_continuous(
 
     clear_device=True 时另外发送 device.op.clear。
     """
-    with manual_session_lock:
-        manual_session["generation"] += 1
-        manual_session["active"] = False
-        manual_session["a"] = None
-        manual_session["b"] = None
+    with ws_send_lock:
+        with manual_session_lock:
+            manual_session["generation"] += 1
+            manual_session["active"] = False
+            manual_session["a"] = None
+            manual_session["b"] = None
+            manual_session["output_token"] = None
 
-    if clear_device:
-        return clear_device_output(
-            "停止手动持续会话"
-        )
+        if clear_device:
+            return clear_device_output(
+                "停止手动持续会话"
+            )
 
     return (
         True,
@@ -3516,272 +3629,126 @@ def manual_continuous_status():
         }
 
 
-def _manual_continuous_worker(
-    generation,
-):
-    """
-    手动 -1 是 Coyote 内部的持续会话标记。
-
-    每轮只向 DG-LAB 发送 CONTINUOUS_SEGMENT_MS
-    的有限片段，再根据会话是否仍有效决定是否续播。
-    """
-    add_log(
-        "手动控制",
-        "持续会话启动",
-        (
-            f"有限片段="
-            f"{CONTINUOUS_SEGMENT_MS}ms"
-        ),
-    )
-
-    while True:
-        with manual_session_lock:
-            if (
-                generation
-                != manual_session[
-                    "generation"
-                ]
-                or not manual_session[
-                    "active"
-                ]
-            ):
-                break
-
-            a_payload = (
-                manual_session[
-                    "a"
-                ]
-            )
-            b_payload = (
-                manual_session[
-                    "b"
-                ]
-            )
-
-        # 总输出开关关闭或设备消失时自动退出。
-        if not master_output_enabled:
-            break
-
-        if not get_slot_id():
-            break
-
-        sent_any = False
-
-        for payload in (
-            a_payload,
-            b_payload,
-        ):
-            if not isinstance(
-                payload,
-                dict,
-            ):
-                continue
-
-            if not is_continuous_duration(
-                payload.get(
-                    "configured_duration",
-                    1000,
-                )
-            ):
-                continue
-
-            _send_manual_payload_once(
-                payload
-            )
-
-            sent_any = True
-
-        if not sent_any:
-            break
-
-        # 在片段结束前稍早续播，
-        # 避免因线程调度造成明显间隙。
-        wait_seconds = max(
-            0.25,
-            (
-                CONTINUOUS_SEGMENT_MS
-                / 1000.0
-                * 0.85
-            ),
+def _manual_session_current(generation):
+    with manual_session_lock:
+        return (
+            generation == manual_session["generation"]
+            and manual_session["active"]
         )
 
-        deadline = (
-            time.time()
-            + wait_seconds
-        )
 
-        should_exit = False
-
-        while (
-            time.time()
-            < deadline
-        ):
-            with manual_session_lock:
-                if (
-                    generation
-                    != manual_session[
-                        "generation"
-                    ]
-                    or not manual_session[
-                        "active"
-                    ]
-                ):
-                    should_exit = True
+def _manual_continuous_worker(generation, token):
+    """Renew finite segments only for the session and destination we started."""
+    add_log("手动控制", "持续会话启动", f"有限片段={CONTINUOUS_SEGMENT_MS}ms")
+    try:
+        with output_context(token):
+            while is_output_token_current(token):
+                with manual_session_lock:
+                    payloads = (manual_session["a"], manual_session["b"])
+                sent_any = False
+                failed = False
+                for payload in payloads:
+                    if not isinstance(payload, dict):
+                        continue
+                    if not is_continuous_duration(payload.get("configured_duration", 1000)):
+                        continue
+                    ok, _message = _send_manual_payload_once(payload)
+                    if not ok:
+                        failed = True
+                        break
+                    sent_any = True
+                if failed or not sent_any:
                     break
 
-            if (
-                not master_output_enabled
-                or not get_slot_id()
-            ):
-                should_exit = True
-                break
+                deadline = time.monotonic() + max(0.25, CONTINUOUS_SEGMENT_MS / 1000.0 * 0.85)
+                while time.monotonic() < deadline:
+                    if not is_output_token_current(token):
+                        return
+                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    finally:
+        # A superseded worker owns neither the new session nor its device tasks.
+        # Serialize this ownership check with session replacement and all sends.
+        with ws_send_lock:
+            if _manual_session_current(generation):
+                with dg_lock:
+                    same_destination = (
+                        token.generation == _output_generation
+                        and token.local_generation == _local_output_generation
+                        and token.ws is dg_ws
+                        and token.client_id == dg["app_id"]
+                        and token.slot_id == dg["slot_id"]
+                    )
+                if same_destination:
+                    clear_device_output("手动持续会话结束", local_only=True)
+                else:
+                    stop_manual_continuous(clear_device=False)
+        add_log("手动控制", "持续会话结束", "")
 
-            time.sleep(
-                0.05
+
+@_output_operation
+def start_manual_continuous(*, a_payload=None, b_payload=None):
+    a_continuous = isinstance(a_payload, dict) and is_continuous_duration(
+        a_payload.get("configured_duration", 1000)
+    )
+    b_continuous = isinstance(b_payload, dict) and is_continuous_duration(
+        b_payload.get("configured_duration", 1000)
+    )
+    if not a_continuous and not b_continuous:
+        return False, "没有设置 -1 的持续通道"
+
+    with ws_send_lock:
+        if not master_output_enabled:
+            return False, "请先开启“允许电击输出”"
+        if not get_slot_id():
+            return False, "没有检测到郊狼设备"
+        if not is_output_token_current(current_output_token()):
+            return False, "输出已取消或设备连接已改变"
+        # Invalidate the old worker before the new one can write to the socket.
+        stop_manual_continuous(clear_device=False)
+        with manual_session_lock:
+            generation = manual_session["generation"] + 1
+            manual_session.update(
+                generation=generation,
+                active=True,
+                a=dict(a_payload) if a_continuous else None,
+                b=dict(b_payload) if b_continuous else None,
             )
-
-        if should_exit:
-            break
-
-    with manual_session_lock:
-        if (
-            generation
-            == manual_session[
-                "generation"
-            ]
-        ):
-            manual_session[
-                "active"
-            ] = False
-
-            manual_session[
-                "a"
-            ] = None
-
-            manual_session[
-                "b"
-            ] = None
-
-    # 如果是因为断连或总开关关闭退出，
-    # 尝试清除设备任务；clear 内部也会再次取消 generation。
-    try:
-        clear_device_output(
-            "手动持续会话结束"
-        )
-    except Exception:
-        pass
-
-    add_log(
-        "手动控制",
-        "持续会话结束",
-        "",
-    )
-
-
-def start_manual_continuous(
-    *,
-    a_payload=None,
-    b_payload=None,
-):
-    if not master_output_enabled:
-        return (
-            False,
-            "请先开启“允许电击输出”",
-        )
-
-    if not get_slot_id():
-        return (
-            False,
-            "没有检测到郊狼设备",
-        )
-
-    a_continuous = (
-        isinstance(
-            a_payload,
-            dict,
-        )
-        and is_continuous_duration(
-            a_payload.get(
-                "configured_duration",
-                1000,
-            )
-        )
-    )
-
-    b_continuous = (
-        isinstance(
-            b_payload,
-            dict,
-        )
-        and is_continuous_duration(
-            b_payload.get(
-                "configured_duration",
-                1000,
-            )
-        )
-    )
-
-    if (
-        not a_continuous
-        and not b_continuous
-    ):
-        return (
-            False,
-            "没有设置 -1 的持续通道",
-        )
-
-    # 新持续会话替代旧会话。
-    stop_manual_continuous(
-        clear_device=False
-    )
-
-    with manual_session_lock:
-        generation = (
-            manual_session[
-                "generation"
-            ]
-            + 1
-        )
-
-        manual_session[
-            "generation"
-        ] = generation
-
-        manual_session[
-            "active"
-        ] = True
-
-        manual_session[
-            "a"
-        ] = (
-            a_payload
-            if a_continuous
-            else None
-        )
-
-        manual_session[
-            "b"
-        ] = (
-            b_payload
-            if b_continuous
-            else None
-        )
+        token = capture_output_token(validator=lambda: _manual_session_current(generation))
+        with manual_session_lock:
+            manual_session["output_token"] = token
 
     threading.Thread(
         target=_manual_continuous_worker,
-        args=(
-            generation,
-        ),
+        args=(generation, token),
         name="ManualContinuous",
         daemon=True,
     ).start()
-
-    return (
-        True,
-        "手动持续会话已启动",
-    )
+    return True, "手动持续会话已启动"
 
 
+def _replace_manual_continuous_channel(channel):
+    """Retire a channel's old worker without interrupting the other channel."""
+    key, other_key = ("a", "b") if channel == 0 else ("b", "a")
+    with ws_send_lock:
+        if not is_output_token_current(current_output_token()):
+            return
+        with manual_session_lock:
+            if not manual_session["active"] or manual_session[key] is None:
+                return
+            old_token = manual_session["output_token"]
+            remaining = manual_session[other_key]
+        # Only renew the other channel if its original destination still exists.
+        if not is_output_token_current(old_token):
+            remaining = None
+        stop_manual_continuous(clear_device=False)
+        if remaining is not None:
+            if other_key == "a":
+                start_manual_continuous(a_payload=remaining)
+            else:
+                start_manual_continuous(b_payload=remaining)
+
+
+@_output_operation
 def send_manual_channel(
     channel,
     intensity,
@@ -3823,11 +3790,15 @@ def send_manual_channel(
             b_payload=payload,
         )
 
+    # A finite command replaces this channel's continuing task. The other
+    # channel may keep playing, but an old worker cannot send its cached payload.
+    _replace_manual_continuous_channel(payload["channel"])
     return _send_manual_payload_once(
         payload
     )
 
 
+@_output_operation
 def send_manual_dual(
     intensity_a,
     intensity_b,
@@ -3842,6 +3813,7 @@ def send_manual_dual(
       A=2000, B=-1
       A=-1, B=-1
     """
+    stop_manual_continuous(clear_device=False)
     a_payload = _manual_payload(
         0,
         intensity_a,
@@ -4637,6 +4609,7 @@ def calculate_rule_intensities(
     }
 
 
+@_output_operation
 def send_rule_output(
     rule_key,
     event_name,
@@ -5337,7 +5310,7 @@ def handle_game_rules(current, previous):
     if peak_is_incapacitated(current):
         was_incapacitated = peak_is_incapacitated(previous)
         if not was_incapacitated:
-            clear_device_output("角色死亡/昏迷，安全锁立即停止全部电击")
+            clear_device_output("角色死亡/昏迷，安全锁立即停止全部电击", local_only=True)
             add_log("系统", "死亡/昏迷安全锁", "已屏蔽全部电击，恢复正常状态后自动解除")
         return
 
@@ -7721,6 +7694,7 @@ def _send_custom_channel(
     )
 
 
+@_output_operation
 def send_custom_rule_output(
     item,
     output_cfg,

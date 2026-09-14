@@ -167,6 +167,11 @@ def _event_keys():
     v=getattr(_EVENTS,"keys",None); return v if isinstance(v,set) else set()
 
 
+def detect_trigger(graph, node, current, previous):
+    """Compatibility fallback; integration installs independent node detectors."""
+    return str(node.get("params", {}).get("rule_key") or "") in _event_keys()
+
+
 def _status(current,name):
     fallback=None; key=str(name or "Injury")
     for i,(raw,zh) in enumerate(getattr(B,"STATUS_ORDER",[])):
@@ -196,7 +201,7 @@ def _eval(g,nid,current,previous,cache,stack):
     def values(port):return [_eval(g,e["from"],current,previous,cache,stack) for e in _incoming(g,nid,port)]
     def first(port,d=None):
         v=values(port); return v[0] if v else d
-    if typ=="trigger": v=str(p.get("rule_key") or "") in _event_keys()
+    if typ=="trigger": v=detect_trigger(g,n,current,previous)
     elif typ=="death": v=bool(current.get("dead",False))
     elif typ=="passed": v=bool(current.get("passedOut",False))
     elif typ=="telemetry": v=_get(current,p.get("path","hp"),p.get("default",0))
@@ -338,7 +343,7 @@ def install_backend():
         return original_send(rule_key,event_name,change_detail,current_value_pct=current_value_pct,continuous=continuous,change_delta_pct=change_delta_pct)
     B.send_rule_output=send
     original_handle=B.handle_game_rules
-    def handle(current,previous):
+    def handle_packet(current,previous):
         if not isinstance(current,dict) or not isinstance(previous,dict):return original_handle(current,previous)
         if current.get("localPlayer") is False or current.get("hasCharacter",True) is False or previous.get("hasCharacter",True) is False:return original_handle(current,previous)
         try:
@@ -346,17 +351,32 @@ def install_backend():
         except Exception:pass
         now=B.peak_is_incapacitated(current); was=B.peak_is_incapacitated(previous)
         if now:
-            if not was:B.clear_device_output("角色死亡/昏迷：先清除普通输出，再执行专用规则"); B.add_log("系统","死亡/昏迷规则域","普通规则已锁定；仅死亡/昏迷专用规则可输出")
+            token = B.current_output_token()
+            if not was:
+                # A deliberate incapacity clear may start its following special
+                # effect, but must not revive an event already cancelled by Stop.
+                with B.ws_send_lock:
+                    still_current = B.is_output_token_current(token)
+                    B.clear_device_output("角色死亡/昏迷：先清除普通输出，再执行专用规则", local_only=True)
+                    if still_current:
+                        token = B.capture_output_token()
+                B.add_log("系统","死亡/昏迷规则域","普通内置规则已锁定；自定义规则按各自条件执行")
             _EVENTS.keys=set()
             try:
-                if current.get("dead") and not previous.get("dead"):_EVENTS.keys.add("dead"); _send_special_builtin("dead","死亡","否 → 是")
-                if current.get("passedOut") and not previous.get("passedOut"):_EVENTS.keys.add("passedOut"); _send_special_builtin("passedOut","昏迷","否 → 是")
-                return evaluate_all(current,previous,True)
+                # The intentional incapacity clear ends ordinary output. Its
+                # following special/custom effects form a new output operation.
+                with B.output_context(token):
+                    if current.get("dead") and not previous.get("dead"):_EVENTS.keys.add("dead"); _send_special_builtin("dead","死亡","否 → 是")
+                    if current.get("passedOut") and not previous.get("passedOut"):_EVENTS.keys.add("passedOut"); _send_special_builtin("passedOut","昏迷","否 → 是")
+                    return evaluate_all(current,previous,True)
             finally:_EVENTS.keys=set()
         _EVENTS.keys=set()
         try:
             result=original_handle(current,previous); evaluate_all(current,previous,False); return result
         finally:_EVENTS.keys=set()
+    def handle(current,previous):
+        with B.output_context():
+            return handle_packet(current,previous)
     B.handle_game_rules=handle
 
 

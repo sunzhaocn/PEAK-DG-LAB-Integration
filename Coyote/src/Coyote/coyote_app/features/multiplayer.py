@@ -18,6 +18,7 @@ import socket
 import threading
 import time
 import uuid
+from functools import wraps
 from io import BytesIO
 
 import backend as B
@@ -75,6 +76,15 @@ REMOTE_OUTPUT_ENABLED = False
 PLAYER_LEAVE_GRACE_SECONDS = 12.0
 # A completely stale PEAK multiplayer stream defines a new safety session.
 MULTIPLAYER_SESSION_TIMEOUT = 6.0
+
+
+def _serialized_output(function):
+    """Keep state changes, cancellation and socket writes in one transaction."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with B.ws_send_lock:
+            return function(*args, **kwargs)
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -292,8 +302,13 @@ def _sync_default_backend():
         B.dg["connect_state"] = device.get("connectState") or state.get("state")
 
 
+@_serialized_output
 def _invalidate_default_route(reason):
     """Invalidate an APP-scoped local route without permitting failover."""
+    # Reconnecting the same client/slot is still a new route lifetime. Retire
+    # delayed tasks now, before these identifiers can become available again.
+    B.cancel_pending_output(local_only=True)
+    B.stop_manual_continuous(clear_device=False)
     with _DEVICE_LOCK:
         was_selected = bool(_DEFAULT_ROUTE.get("selected"))
         _DEFAULT_ROUTE.update({
@@ -310,6 +325,7 @@ def _invalidate_default_route(reason):
     return was_selected
 
 
+@_serialized_output
 def set_default_device(client_id, slot_id, *, automatic=False):
     client_id = _str(client_id).strip()
     slot_id = _str(slot_id).strip()
@@ -325,6 +341,17 @@ def set_default_device(client_id, slot_id, *, automatic=False):
         ]
     if conflicts:
         return False, "该设备已绑定远程玩家，请先解绑后再设为本地主设备"
+    previous = _default_route_snapshot()
+    previous_key = (previous.get("client_id"), previous.get("slot_id"))
+    if previous.get("selected") and previous_key != (client_id, slot_id):
+        # Invalidate delayed work before clearing the old route. Holding the
+        # send lock prevents a checked worker from writing after this clear.
+        B.cancel_pending_output(local_only=True)
+        B.stop_manual_continuous(clear_device=False)
+        if previous.get("app_connected") and not _clear_bound_device(
+            {"client_id": previous_key[0], "slot_id": previous_key[1]}, "切换本地主设备"
+        ):
+            return False, "原主设备停止命令发送失败，请重试后再切换"
     device = state.get("device") or {}
     with _DEVICE_LOCK:
         _DEFAULT_ROUTE.update({
@@ -388,6 +415,8 @@ def _on_device_transition(client_id, slot_id, was_online, is_online):
     if not is_online:
         _cancel_route_ramps(client_id, slot_id)
         if is_default:
+            B.cancel_pending_output(local_only=True)
+            B.stop_manual_continuous(clear_device=False)
             _sync_default_backend()
             B.add_log("连接", "本地主设备暂时离线", f"client={client_id}; slot={slot_id}; 不切换到其他设备，等待原设备恢复")
         with _BIND_LOCK:
@@ -424,6 +453,7 @@ def _clear_bound_device(binding, reason="玩家离开/解绑"):
         return False
 
 
+@_serialized_output
 def clear_multiplayer_outputs(reason="多人安全清除"):
     with _BIND_LOCK:
         bindings = {pid: dict(v) for pid, v in _PLAYER_BINDINGS.items() if isinstance(v, dict)}
@@ -442,6 +472,7 @@ def clear_multiplayer_outputs(reason="多人安全清除"):
     return cleared
 
 
+@_serialized_output
 def _reset_multiplayer_session(reason):
     global REMOTE_OUTPUT_ENABLED
     cleared = clear_multiplayer_outputs(reason)
@@ -493,6 +524,14 @@ def _multiplayer_watchdog_loop():
 # Multiplayer PEAK telemetry
 # ---------------------------------------------------------------------------
 
+def _player_allows_output(player):
+    return isinstance(player, dict) and not any(
+        player.get(flag, False)
+        for flag in ("isLocal", "dead", "passedOut", "fullyPassedOut", "telemetryMissing")
+    )
+
+
+@_serialized_output
 def _handle_multiplayer_packet(packet):
     if not isinstance(packet, dict):
         return
@@ -543,6 +582,11 @@ def _handle_multiplayer_packet(packet):
         _PLAYER_STATE["session_active"] = True
         _PLAYER_STATE["revision"] += 1
 
+    for pid, player in current.items():
+        if _player_allows_output(previous.get(pid)) and not _player_allows_output(player):
+            _cancel_player_ramp(pid)
+            _clear_bound_device(_binding_for(pid), "远程玩家死亡/昏迷或遥测暂失")
+
     for pid in joined:
         p = observed[pid]
         B.add_log("多人", "玩家加入", f"{p.get('name','未知玩家')} | id={pid} | scene={p.get('scene','')}")
@@ -559,8 +603,7 @@ def _handle_multiplayer_packet(packet):
         with _BIND_LOCK:
             _PLAYER_BINDINGS.pop(pid, None)
             _REMOTE_LAST_TRIGGER.pop(pid, None)
-        with _REMOTE_RAMP_LOCK:
-            _REMOTE_RAMP_GENERATION.pop(pid, None)
+        # Keep cancellation generations monotonic if this player rejoins.
         B.add_log("多人", "玩家离开", f"{old.get('name','未知玩家')} | id={pid}")
 
     reappeared = set(reappeared)
@@ -613,6 +656,7 @@ def _ensure_app(client_id):
     return app
 
 
+@_serialized_output
 def _update_multi_device_data(client_id, payload):
     if not client_id or not isinstance(payload, dict): return []
     event = payload.get("ev")
@@ -690,14 +734,7 @@ def send_payload_to_client(client_id, payload):
     if not client_id: return False, "目标 DG-LAB APP 无效"
     with _DEVICE_LOCK:
         if client_id not in _MULTI_APPS: return False, "目标 DG-LAB APP 已断开"
-    with B.dg_lock: ws = B.dg_ws
-    if ws is None: return False, "WebSocket 未连接"
-    packet = json.dumps({"type": "message", "clientId": client_id, "data": payload}, ensure_ascii=False)
-    try:
-        with B.ws_send_lock: ws.send(packet)
-        return True, "已发送"
-    except Exception as exc:
-        B.add_log("错误", "多人设备发送失败", str(exc)); return False, str(exc)
+    return B.send_payload(payload, client_id=client_id)
 
 
 def send_rpc_to_client(client_id, method, data=None):
@@ -706,6 +743,7 @@ def send_rpc_to_client(client_id, method, data=None):
     return send_payload_to_client(client_id, payload)
 
 
+@_serialized_output
 def bind_player_device(player_id, client_id, slot_id):
     player_id = _str(player_id).strip()
     client_id = _str(client_id).strip()
@@ -739,7 +777,7 @@ def bind_player_device(player_id, client_id, slot_id):
             ):
                 return False, "该郊狼设备已经绑定到其他玩家，请先解绑"
         old = _PLAYER_BINDINGS.get(player_id)
-        if isinstance(old, dict) and (old.get("client_id") != client_id or _str(old.get("slot_id")) != slot_id):
+        if isinstance(old, dict):
             old_to_clear = dict(old)
         _PLAYER_BINDINGS[player_id] = {"client_id": client_id, "slot_id": slot_id, "enabled": False}
         _REMOTE_LAST_TRIGGER.pop(player_id, None)
@@ -749,6 +787,7 @@ def bind_player_device(player_id, client_id, slot_id):
     return True, "已绑定；仍需手动开启该玩家的远程伤害输出"
 
 
+@_serialized_output
 def unbind_player_device(player_id):
     player_id = _str(player_id).strip()
     with _BIND_LOCK:
@@ -761,6 +800,7 @@ def unbind_player_device(player_id):
     return False, "该玩家没有绑定设备"
 
 
+@_serialized_output
 def set_player_binding_enabled(player_id, enabled):
     player_id = _str(player_id).strip()
     enabled = bool(enabled)
@@ -796,6 +836,7 @@ def get_player_bindings():
     return snapshot
 
 
+@_serialized_output
 def set_remote_output_enabled(enabled):
     global REMOTE_OUTPUT_ENABLED
     enabled = bool(enabled)
@@ -825,9 +866,27 @@ def _next_remote_ramp_generation(player_id):
         value = int(_REMOTE_RAMP_GENERATION.get(player_id, 0) or 0) + 1; _REMOTE_RAMP_GENERATION[player_id] = value; return value
 
 
-def _remote_ramp_worker(player_id, generation, client_id, slot_id, channel, target, duration_ms, ramp_ms, steps):
+def _remote_output_is_current(player_id, generation, client_id, slot_id):
+    if not REMOTE_OUTPUT_ENABLED or not bool(getattr(B, "master_output_enabled", False)):
+        return False
+    with _REMOTE_RAMP_LOCK:
+        if _REMOTE_RAMP_GENERATION.get(player_id) != generation:
+            return False
+    binding = _binding_for(player_id)
+    if not binding or not binding.get("enabled", False):
+        return False
+    if binding.get("client_id") != client_id or _str(binding.get("slot_id")) != slot_id:
+        return False
+    with _PLAYER_LOCK:
+        if not _player_allows_output(_PLAYER_STATE["players"].get(player_id)):
+            return False
+    return _device_exists(client_id, slot_id)
+
+
+def _remote_ramp_worker(player_id, generation, client_id, slot_id, channel, target, duration_ms, ramp_ms, steps, output_token):
     if target <= 0: return
-    ok, _message = send_rpc_to_client(client_id, "device.op", {"s": slot_id, "c": channel, "t": 4, "v": 0, "d": duration_ms, "im": True})
+    with B.output_context(output_token):
+        ok, _message = send_rpc_to_client(client_id, "device.op", {"s": slot_id, "c": channel, "t": 4, "v": 0, "d": duration_ms, "im": True})
     if not ok:
         return
     start = time.monotonic(); interval = ramp_ms / max(1, steps) / 1000.0; last_level = -1
@@ -837,24 +896,21 @@ def _remote_ramp_worker(player_id, generation, client_id, slot_id, channel, targ
             remaining = deadline - time.monotonic()
             if remaining <= 0: break
             time.sleep(min(0.03, remaining))
-        with _REMOTE_RAMP_LOCK:
-            if _REMOTE_RAMP_GENERATION.get(player_id) != generation: return
-        if not REMOTE_OUTPUT_ENABLED or not bool(getattr(B, "master_output_enabled", False)): return
-        binding = _binding_for(player_id)
-        if not binding or not binding.get("enabled", False): return
-        if binding.get("client_id") != client_id or _str(binding.get("slot_id")) != _str(slot_id): return
-        if not _device_exists(client_id, slot_id): return
         level = max(0, min(target, int(round(target * step / steps))))
         if level == last_level and step != steps: continue
         last_level = level; elapsed_ms = int((time.monotonic() - start) * 1000); remaining_duration = max(100, duration_ms - elapsed_ms)
-        ok, _message = send_rpc_to_client(client_id, "device.op", {"s": slot_id, "c": channel, "t": 4, "v": level, "d": remaining_duration, "im": True})
+        # The token validator and actual write share the socket lock with
+        # death, unbind and stop handling, including the initial zero write.
+        with B.output_context(output_token):
+            ok, _message = send_rpc_to_client(client_id, "device.op", {"s": slot_id, "c": channel, "t": 4, "v": level, "d": remaining_duration, "im": True})
         if not ok:
             return
 
 
+@_serialized_output
 def _handle_remote_player_damage(player, previous):
     if player.get("isLocal", False): return
-    if player.get("dead", False) or player.get("passedOut", False) or player.get("fullyPassedOut", False): return
+    if not _player_allows_output(player): return
     old_hp = _float(previous.get("hp", 100.0), 100.0); new_hp = _float(player.get("hp", 100.0), 100.0); drop = old_hp - new_hp
     if drop < 0.1: return
     B.add_log("多人", "远程玩家受伤", f"{player.get('name','未知玩家')} | HP {old_hp:.1f}% → {new_hp:.1f}%（下降 {drop:.1f}%）")
@@ -874,6 +930,24 @@ def _handle_remote_player_damage(player, previous):
     duration_a = B.resolve_rule_duration_ms(B.clamp_duration(cfg.get("play_time_a", 1000))); duration_b = B.resolve_rule_duration_ms(B.clamp_duration(cfg.get("play_time_b", 1000)))
     wa_name, wb_name, waveform_a, waveform_b = _resolve_rule_waveforms(cfg, info.get("tier"))
     if waveform_a is None or waveform_b is None: return
+    generation = _next_remote_ramp_generation(player_id)
+    output_token = B.capture_output_token(
+        client_id=client_id, slot_id=slot_id,
+        validator=lambda: _remote_output_is_current(player_id, generation, client_id, slot_id),
+    )
+    with B.output_context(output_token):
+        _send_remote_damage_output(
+            player, old_hp, new_hp, cfg, client_id, slot_id, generation,
+            output_token, intensity_a, intensity_b, duration_a, duration_b,
+            wa_name, wb_name, waveform_a, waveform_b,
+        )
+
+
+def _send_remote_damage_output(player, old_hp, new_hp, cfg, client_id, slot_id,
+                               generation, output_token, intensity_a, intensity_b,
+                               duration_a, duration_b, wa_name, wb_name,
+                               waveform_a, waveform_b):
+    player_id = player["playerId"]
     results = []
     if intensity_a > 0: results.append(send_rpc_to_client(client_id, "device.op", {"s": slot_id, "c": 0, "t": 0, "d": duration_a, "im": True, "v": waveform_a}))
     if intensity_b > 0: results.append(send_rpc_to_client(client_id, "device.op", {"s": slot_id, "c": 1, "t": 0, "d": duration_b, "im": True, "v": waveform_b}))
@@ -888,9 +962,9 @@ def _handle_remote_player_damage(player, previous):
 
     ramp = bool(cfg.get("ramp_enabled", False))
     if ramp:
-        generation = _next_remote_ramp_generation(player_id); ramp_ms = max(100, min(60000, _int(cfg.get("ramp_duration_ms", 1500), 1500))); steps = max(2, min(100, _int(cfg.get("ramp_steps", 10), 10)))
-        if intensity_a > 0: threading.Thread(target=_remote_ramp_worker, args=(player_id,generation,client_id,slot_id,0,intensity_a,duration_a,min(duration_a,ramp_ms),steps), daemon=True).start()
-        if intensity_b > 0: threading.Thread(target=_remote_ramp_worker, args=(player_id,generation,client_id,slot_id,1,intensity_b,duration_b,min(duration_b,ramp_ms),steps), daemon=True).start()
+        ramp_ms = max(100, min(60000, _int(cfg.get("ramp_duration_ms", 1500), 1500))); steps = max(2, min(100, _int(cfg.get("ramp_steps", 10), 10)))
+        if intensity_a > 0: threading.Thread(target=_remote_ramp_worker, args=(player_id,generation,client_id,slot_id,0,intensity_a,duration_a,min(duration_a,ramp_ms),steps,output_token), daemon=True).start()
+        if intensity_b > 0: threading.Thread(target=_remote_ramp_worker, args=(player_id,generation,client_id,slot_id,1,intensity_b,duration_b,min(duration_b,ramp_ms),steps,output_token), daemon=True).start()
     else:
         if intensity_a > 0: results.append(send_rpc_to_client(client_id, "device.op", {"s": slot_id, "c": 0, "t": 4, "v": intensity_a, "d": duration_a, "im": True}))
         if intensity_b > 0: results.append(send_rpc_to_client(client_id, "device.op", {"s": slot_id, "c": 1, "t": 4, "v": intensity_b, "d": duration_b, "im": True}))
@@ -934,6 +1008,7 @@ def install_backend():
             except (json.JSONDecodeError, UnicodeDecodeError): pass
             except Exception as exc: B.add_log("错误", "PEAK 数据处理异常", str(exc)); time.sleep(0.1)
     B.peak_udp_loop = multiplayer_peak_udp_loop
+    @_serialized_output
     def multiplayer_on_message(ws, message):
         try: data = json.loads(message)
         except Exception: return
@@ -986,6 +1061,7 @@ def install_backend():
             with B.dg_lock: B.dg["error"] = error_text
             B.add_log("错误", "DG-LAB", error_text); return
     B.on_message = multiplayer_on_message
+    @_serialized_output
     def multiplayer_on_close(ws, code, reason):
         global REMOTE_OUTPUT_ENABLED
         REMOTE_OUTPUT_ENABLED = False

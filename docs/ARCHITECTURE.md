@@ -133,7 +133,11 @@ and the base Qt node editor.
 
 Connects visual trigger nodes to existing Coyote detector parameters and output
 modifiers (thresholds, areas, recovery detection, repeat cooldowns, HP ramp,
-etc.). It should adapt existing capabilities rather than redefine graph policy.
+etc.). Visual events use the node's own parameters and graph/node runtime,
+reusing the core telemetry and normalization helpers. They must not depend on
+successful built-in output or temporarily overwrite the built-in rule table.
+Recovery and dwell detectors consume single events when detected, independently
+of whether an output is sent. Domain/guard policy remains in `policy.py`.
 
 ### `visual_rules/policy.py`
 
@@ -167,6 +171,23 @@ Rule domains are separate, but these facilities remain shared infrastructure:
 
 A feature module should not create a second uncontrolled transport stack when an
 existing backend/device API can be reused.
+
+An output operation captures an `OutputToken` before producing device commands.
+The token pins the WebSocket, client and slot, plus global/local cancellation
+generations. Related RPCs share `output_context`; background workers receive the
+captured token explicitly. Do not create a fresh token in a delayed worker, since
+that could revive a stopped task or route it to a newly selected device.
+
+All device sends validate their token while holding `ws_send_lock`, the same
+reentrant lock used by cancellation, clears and route/state transitions. Clear
+commands remain available with the master switch off. Multiplayer sends reuse
+the core transport with an explicit client identity and a validator for the
+player/binding generation. State locks consulted by validators are acquired
+inside the send lock; keep that lock order in transition handlers as well.
+
+Switching the local route cancels local work and clears the previous client/slot
+before replacing the route. It does not cancel unrelated remote player output.
+An obsolete manual worker must exit without clearing a replacement session.
 
 ## 8. Resources and vendored code
 
