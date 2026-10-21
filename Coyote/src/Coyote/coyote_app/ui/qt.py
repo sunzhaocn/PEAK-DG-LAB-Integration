@@ -1,4 +1,4 @@
-import csv, json, os, sys, threading, time, shutil
+import csv, json, math, os, sys, threading, time, shutil, subprocess, tempfile
 from io import BytesIO
 from pathlib import Path
 
@@ -7,7 +7,7 @@ from PIL import Image, ImageEnhance, ImageFilter
 
 try:
     from PySide6.QtCore import Qt, QTimer, Signal, QRect
-    from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
+    from PySide6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPixmap
     from PySide6.QtWidgets import (
         QApplication, QAbstractItemView, QCheckBox, QColorDialog, QComboBox,
         QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
@@ -35,7 +35,7 @@ APPEARANCE_DEFAULTS = {
     "glass_opacity": 0.58,
     "glass_radius": 16,
     "glass_border_opacity": 0.28,
-    "accent": "#5B8CFF",
+    "accent": "#645BC6",
     "show_values": True,
     "show_progress": True,
     "status_decimals": 1,
@@ -44,6 +44,42 @@ APPEARANCE_DEFAULTS = {
 appearance = dict(APPEARANCE_DEFAULTS)
 ASSET_DIR = B.ROOT / "assets" / "background"
 SAVED_BACKGROUND = ASSET_DIR / "wallpaper.jpg"
+
+
+def normalise_appearance():
+    """Keep malformed or older appearance settings from preventing startup."""
+    numeric = (
+        ("background_opacity", 0.0, 1.0, False),
+        ("background_blur", 0, 40, True),
+        ("background_brightness", .15, 1.5, False),
+        ("glass_opacity", .15, .95, False),
+        ("glass_radius", 0, 32, True),
+        ("glass_border_opacity", 0.0, 1.0, False),
+        ("status_decimals", 0, 2, True),
+    )
+    for key, minimum, maximum, integer in numeric:
+        try:
+            raw = appearance.get(key, APPEARANCE_DEFAULTS[key])
+            if isinstance(raw, bool):
+                raise ValueError("boolean is not a numeric setting")
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError("non-finite appearance setting")
+            if integer:
+                value = int(value)
+        except (TypeError, ValueError, OverflowError):
+            value = APPEARANCE_DEFAULTS[key]
+        appearance[key] = max(minimum, min(maximum, value))
+
+    for key in ("background_enabled", "show_values", "show_progress", "compact_status_cards"):
+        if not isinstance(appearance.get(key), bool):
+            appearance[key] = APPEARANCE_DEFAULTS[key]
+
+    if appearance.get("background_fit") not in ("cover", "contain", "stretch"):
+        appearance["background_fit"] = APPEARANCE_DEFAULTS["background_fit"]
+
+    accent = QColor(str(appearance.get("accent", "")))
+    appearance["accent"] = accent.name() if accent.isValid() else APPEARANCE_DEFAULTS["accent"]
 
 
 def load_full_config():
@@ -70,15 +106,7 @@ def load_full_config():
                 appearance[k] = v
     except Exception:
         pass
-    appearance["background_opacity"] = max(0.0, min(1.0, float(appearance.get("background_opacity", .92))))
-    appearance["background_blur"] = max(0, min(40, int(appearance.get("background_blur", 6))))
-    appearance["background_brightness"] = max(.15, min(1.5, float(appearance.get("background_brightness", .68))))
-    appearance["glass_opacity"] = max(.15, min(.95, float(appearance.get("glass_opacity", .58))))
-    appearance["glass_radius"] = max(0, min(32, int(appearance.get("glass_radius", 16))))
-    appearance["glass_border_opacity"] = max(0.0, min(1.0, float(appearance.get("glass_border_opacity", .28))))
-    appearance["status_decimals"] = max(0, min(2, int(appearance.get("status_decimals", 1))))
-    for k in ("background_enabled", "show_values", "show_progress", "compact_status_cards"):
-        appearance[k] = bool(appearance.get(k, APPEARANCE_DEFAULTS[k]))
+    normalise_appearance()
 
     # 背景持久化兜底：
     # 选择背景时会复制到项目 assets/background/wallpaper.jpg。
@@ -108,11 +136,22 @@ def save_full_config():
         "appearance": dict(appearance),
         "language": I18N.get_language(),
     }
+    temporary = None
     try:
-        B.CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        B.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=B.CONFIG_FILE.parent,
+            prefix=f".{B.CONFIG_FILE.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, B.CONFIG_FILE)
         return True, "配置已保存"
     except Exception as e:
         return False, str(e)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def resolve_background():
@@ -135,8 +174,17 @@ def rel_root(p):
 def rgb(hex_color):
     c = QColor(str(hex_color))
     if not c.isValid():
-        c = QColor("#5B8CFF")
+        c = QColor("#645BC6")
     return c.red(), c.green(), c.blue()
+
+
+def relative_luminance(red, green, blue):
+    channels = (
+        value / 12.92 if value <= .04045 else ((value + .055) / 1.055) ** 2.4
+        for value in (red / 255, green / 255, blue / 255)
+    )
+    r, g, b = channels
+    return .2126 * r + .7152 * g + .0722 * b
 
 
 # ============================================================
@@ -320,9 +368,9 @@ class BackgroundWidget(QWidget):
                 height,
             ),
             (
-                8,
-                12,
-                18,
+                248,
+                248,
+                255,
             ),
         )
 
@@ -546,9 +594,9 @@ class BackgroundWidget(QWidget):
                             height,
                         ),
                         (
-                            8,
-                            12,
-                            18,
+                            248,
+                            248,
+                            255,
                         ),
                     )
 
@@ -648,12 +696,11 @@ class BackgroundWidget(QWidget):
         )
 
         try:
-            painter.fillRect(
-                self.rect(),
-                QColor(
-                    "#080C12"
-                ),
-            )
+            gradient = QLinearGradient(0, 0, self.width(), self.height())
+            gradient.setColorAt(0.0, QColor("#F9F7FF"))
+            gradient.setColorAt(0.55, QColor("#F0F4FF"))
+            gradient.setColorAt(1.0, QColor("#FFF5FA"))
+            painter.fillRect(self.rect(), QBrush(gradient))
 
             if not appearance.get(
                 "background_enabled",
@@ -1380,10 +1427,10 @@ class Window(QMainWindow):
 
         self.statusBar().setStyleSheet("""
             QStatusBar {
-                background: rgba(8,13,21,220);
-                color: #DCE7F5;
-                border-top: 1px solid rgba(210,225,245,55);
-                padding: 3px 8px;
+                background: rgba(249,247,255,245);
+                color: #525976;
+                border-top: 1px solid #E0E2F0;
+                padding: 4px 10px;
             }
         """)
         self.feedback("控制器已启动。等待 PEAK / DG-LAB 连接……", 5000)
@@ -1463,9 +1510,7 @@ class Window(QMainWindow):
         """
         统一弹窗。
 
-        旧版全局 QWidget 样式把 QMessageBox 的文字也设成白色，
-        但系统消息框局部可能仍是浅色背景，结果看起来像“没有文字”。
-        这里给消息框明确设置深色背景、白色正文和按钮文字。
+        Give dialogs explicit colors so platform palettes cannot hide text.
         """
         box = QMessageBox(self)
 
@@ -1505,11 +1550,11 @@ class Window(QMainWindow):
         box.setStyleSheet(
             """
             QMessageBox {
-                background-color: #111827;
+                background-color: #FAFAFF;
             }
 
             QMessageBox QLabel {
-                color: #EAF0FA;
+                color: #30334F;
                 min-width: 360px;
                 font-family: "Microsoft YaHei UI", "Segoe UI";
                 font-size: 13px;
@@ -1519,15 +1564,15 @@ class Window(QMainWindow):
                 min-width: 88px;
                 min-height: 30px;
                 padding: 5px 14px;
-                color: #F8FAFC;
-                background-color: #243247;
-                border: 1px solid #45566F;
-                border-radius: 7px;
+                color: #353657;
+                background-color: #F5F4FC;
+                border: 1px solid #D8D9EC;
+                border-radius: 9px;
             }
 
             QMessageBox QPushButton:hover {
-                background-color: #31558E;
-                border-color: #5B8CFF;
+                background-color: #EDE9FC;
+                border-color: #645BC6;
             }
             """
         )
@@ -2208,50 +2253,80 @@ class Window(QMainWindow):
             self.content.raise_()
 
     def apply_theme(self, refresh_background=False):
-        accent = appearance.get("accent", "#5B8CFF")
+        accent = appearance.get("accent", "#645BC6")
         r, g, b = rgb(accent)
         op = float(appearance.get("glass_opacity", .58))
         rad = int(appearance.get("glass_radius", 16))
         bop = float(appearance.get("glass_border_opacity", .28))
-        panel = f"rgba(12,18,28,{int(op*255)})"
-        soft = f"rgba(20,29,44,{int(min(.95,op+.08)*255)})"
-        border = f"rgba(220,232,248,{int(bop*255)})"
+        # A pale, nearly opaque card stays readable over custom wallpapers.
+        panel = f"rgba(255,255,255,{int((.80 + .19 * op) * 255)})"
+        border = f"rgba(153,159,198,{max(40, int(bop * 200))})"
+        soft = "rgba(250,249,255,245)"
+        luminance = relative_luminance(r, g, b)
+        accent_text = "#FFFFFF" if luminance < .18 else "#000000"
+        hover_accent = QColor(r, g, b).darker(108) if luminance < .18 else QColor(r, g, b).lighter(108)
+        text_accent = QColor(r, g, b)
+        while relative_luminance(text_accent.red(), text_accent.green(), text_accent.blue()) > .10:
+            text_accent = text_accent.darker(115)
+        status_accent = text_accent.name()
 
         self.setStyleSheet(f'''
-            QMainWindow{{background:#080C12}}
-            QWidget{{color:#EAF0FA;font-family:"Microsoft YaHei UI","Segoe UI";font-size:13px}}
-            QFrame#sidebar{{background:rgba(8,13,21,190);border:1px solid {border};border-radius:{rad}px}}
+            QMainWindow{{background:#F6F6FD}}
+            QWidget{{color:#30334F;font-family:"Microsoft YaHei UI","Segoe UI";font-size:13px}}
+            QFrame#sidebar{{background:rgba(249,247,255,246);border:1px solid #E3E1F1;border-radius:{rad}px}}
             QFrame#glassPanel,QFrame#glassCard,QGroupBox,QFrame#tierRow{{background:{panel};border:1px solid {border};border-radius:{rad}px}}
-            QFrame#glassCard:hover{{background:rgba(18,27,42,{int(min(.95,op+.1)*255)});border-color:rgba({r},{g},{b},190)}}
-            QFrame#tierRow{{background:rgba(255,255,255,10);border-radius:10px}}
-            QGroupBox{{margin-top:12px;padding-top:12px;font-weight:600}}
-            QGroupBox::title{{subcontrol-origin:margin;left:12px;padding:0 6px}}
-            QLabel#title{{font-size:23px;font-weight:700}}
-            QLabel#subtitle,QLabel#muted{{color:#94A3B8}}
-            QLabel#cardTitle{{font-weight:700}}
-            QLabel#statusValue{{color:rgb({r},{g},{b});font-weight:700;font-size:15px}}
-            QPushButton{{background:{soft};border:1px solid {border};border-radius:9px;padding:8px 12px}}
-            QPushButton:hover{{background:rgba({r},{g},{b},105);border-color:rgba({r},{g},{b},180)}}
-            QPushButton#primary{{background:rgba({r},{g},{b},215);font-weight:700}}
-            QPushButton#danger{{background:rgba(220,70,82,220);font-weight:700}}
-            QPushButton#dangerGhost{{background:rgba(180,55,65,90);color:#FFCDD2}}
-            QPushButton#navButton{{text-align:left;background:transparent;border:0;padding:10px 12px;color:#B9C6D9;font-size:14px}}
-            QPushButton#navButton:checked{{background:rgba({r},{g},{b},95);color:white;border:1px solid rgba({r},{g},{b},160)}}
-            QPushButton#sidebarToggle{{background:rgba(255,255,255,12);border:0}}
-            QLineEdit,QTextEdit,QSpinBox,QDoubleSpinBox,QComboBox{{background:rgba(8,13,21,195);border:1px solid {border};border-radius:8px;padding:7px;min-height:22px}}
-            QComboBox QAbstractItemView{{background:#111A28;color:#EAF0FA;selection-background-color:rgba({r},{g},{b},150)}}
-            QProgressBar{{background:rgba(255,255,255,18);border:0;border-radius:3px}}
-            QProgressBar::chunk{{background:rgb({r},{g},{b});border-radius:3px}}
-            QTableWidget,QListWidget{{background:rgba(8,13,21,165);alternate-background-color:rgba(255,255,255,10);border:1px solid {border};border-radius:10px;gridline-color:rgba(255,255,255,18)}}
+            QFrame#glassCard:hover{{background:#FFFFFF;border-color:rgba({r},{g},{b},145)}}
+            QFrame#tierRow{{background:rgba(250,249,255,235);border-radius:10px}}
+            QGroupBox{{margin-top:14px;padding-top:14px;font-weight:600}}
+            QGroupBox::title{{subcontrol-origin:margin;left:14px;padding:0 6px;color:#484668}}
+            QLabel#title{{font-size:23px;font-weight:700;color:#302D55}}
+            QLabel#subtitle,QLabel#muted{{color:#4D5670}}
+            QLabel#cardTitle{{font-weight:700;color:#3C3C60}}
+            QLabel#statusValue{{color:{status_accent};font-weight:700;font-size:15px}}
+            QPushButton{{background:{soft};border:1px solid #DADDEF;border-radius:10px;padding:8px 12px;color:#353657}}
+            QPushButton:hover{{background:#F0EEFF;border-color:rgba({r},{g},{b},130)}}
+            QPushButton:pressed{{background:#E8E4FC}}
+            QPushButton:focus{{border:2px solid rgb({r},{g},{b})}}
+            QPushButton:disabled{{background:#F3F3F8;color:#80869A;border-color:#E2E4ED}}
+            QPushButton#primary{{background:rgb({r},{g},{b});border-color:rgb({r},{g},{b});color:{accent_text};font-weight:700}}
+            QPushButton#primary:hover{{background:{hover_accent.name()};border-color:{hover_accent.name()}}}
+            QPushButton#danger{{background:#B53660;border-color:#B53660;color:#FFFFFF;font-weight:700}}
+            QPushButton#danger:hover{{background:#9D2C50}}
+            QPushButton#dangerGhost{{background:#FFF0F4;border-color:#F0C4D1;color:#913453}}
+            QPushButton#navButton{{text-align:left;background:transparent;border:1px solid transparent;padding:10px 12px;color:#555B79;font-size:14px}}
+            QPushButton#navButton:hover{{background:#F0ECFF;border-color:#E4DFF9}}
+            QPushButton#navButton:checked{{background:rgba({r},{g},{b},38);color:#343057;border:1px solid rgba({r},{g},{b},95);font-weight:700}}
+            QPushButton#sidebarToggle{{background:#F2F0FC;border:1px solid #E1DFF1}}
+            QLineEdit,QTextEdit,QSpinBox,QDoubleSpinBox,QComboBox{{background:#FFFFFF;border:1px solid #D8DCEC;border-radius:8px;padding:7px;min-height:22px;selection-background-color:rgba({r},{g},{b},100);selection-color:#24213E}}
+            QLineEdit:focus,QTextEdit:focus,QSpinBox:focus,QDoubleSpinBox:focus,QComboBox:focus{{border:2px solid rgb({r},{g},{b})}}
+            QLineEdit:read-only{{background:#F6F7FC;color:#505774}}
+            QComboBox QAbstractItemView{{background:#FFFFFF;color:#30334F;selection-background-color:#E9E5FB;selection-color:#24213E}}
+            QProgressBar{{background:#E9EBF6;border:0;border-radius:4px}}
+            QProgressBar::chunk{{background:rgb({r},{g},{b});border-radius:4px}}
+            QTableWidget,QListWidget{{background:rgba(255,255,255,245);alternate-background-color:#F7F8FD;border:1px solid #E1E3F0;border-radius:10px;gridline-color:#E8EAF3;selection-background-color:#E7E3FA;selection-color:#292745}}
             QListWidget::item{{padding:9px;border-radius:7px}}
-            QListWidget::item:selected{{background:rgba({r},{g},{b},105);color:white}}
-            QHeaderView::section{{background:rgba(17,27,42,210);border:0;padding:8px;font-weight:700}}
+            QListWidget::item:selected{{background:#E7E3FA;color:#292745}}
+            QHeaderView::section{{background:#F1F2FB;border:0;border-bottom:1px solid #DDE1EF;padding:8px;font-weight:700;color:#494D70}}
+            QTabWidget::pane{{border:1px solid #DEE1EE;border-radius:9px;background:rgba(255,255,255,245)}}
+            QTabBar::tab{{background:#F0F1FA;color:#59617F;border:1px solid #DEE1EE;padding:8px 14px;margin-right:3px;border-top-left-radius:8px;border-top-right-radius:8px}}
+            QTabBar::tab:selected{{background:#FFFFFF;color:{status_accent};font-weight:700}}
             QScrollArea,QScrollArea>QWidget>QWidget{{background:transparent;border:0}}
-            QMessageBox{{background:#111827}}
-            QMessageBox QLabel{{color:#EAF0FA;background:transparent}}
-            QSlider::groove:horizontal{{height:5px;background:rgba(255,255,255,30);border-radius:2px}}
-            QSlider::handle:horizontal{{background:rgb({r},{g},{b});width:16px;margin:-6px 0;border-radius:8px}}
-            QSplitter::handle{{background:rgba(255,255,255,18);width:2px;height:2px}}
+            QScrollBar:vertical{{background:#F4F5FC;border:0;width:12px;margin:0;border-radius:6px}}
+            QScrollBar::handle:vertical{{background:#C9CDE4;min-height:28px;margin:2px;border-radius:4px}}
+            QScrollBar::handle:vertical:hover{{background:rgba({r},{g},{b},155)}}
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;border:0;background:transparent}}
+            QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{{background:transparent}}
+            QScrollBar:horizontal{{background:#F4F5FC;border:0;height:12px;margin:0;border-radius:6px}}
+            QScrollBar::handle:horizontal{{background:#C9CDE4;min-width:28px;margin:2px;border-radius:4px}}
+            QScrollBar::handle:horizontal:hover{{background:rgba({r},{g},{b},155)}}
+            QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal{{width:0;border:0;background:transparent}}
+            QScrollBar::add-page:horizontal,QScrollBar::sub-page:horizontal{{background:transparent}}
+            QMessageBox{{background:#FAFAFF}}
+            QMessageBox QLabel{{color:#30334F;background:transparent}}
+            QToolTip{{background:#FFFFFF;color:#30334F;border:1px solid #DADDEF;padding:5px}}
+            QSlider::groove:horizontal{{height:6px;background:#E6E8F3;border-radius:3px}}
+            QSlider::handle:horizontal{{background:rgb({r},{g},{b});width:16px;margin:-5px 0;border-radius:8px}}
+            QSplitter::handle{{background:#DEE1EE;width:2px;height:2px}}
         ''')
         if refresh_background:
             self.bg.invalidate()
@@ -2298,7 +2373,7 @@ class Window(QMainWindow):
 
         top = QHBoxLayout()
         self.side_title = QLabel("COYOTE")
-        self.side_title.setStyleSheet("font-size:18px;font-weight:800")
+        self.side_title.setStyleSheet("font-size:18px;font-weight:800;color:#51489C")
         self.sidebar_toggle = QPushButton("≪")
         self.sidebar_toggle.setObjectName("sidebarToggle")
         self.sidebar_toggle.setFixedWidth(38)
@@ -2315,15 +2390,15 @@ class Window(QMainWindow):
 
         self.page_stack = QStackedWidget()
         pages = [
-            ("⌂", "总览", "dashboard"),
-            ("◎", "游戏遥测", "telemetry"),
-            ("⚡", "电击规则", "rules"),
-            ("≡", "事件日志", "logs"),
-            ("⌁", "连接 / 配对", "pair"),
-            ("◈", "设备控制", "device"),
-            ("〽", "自定义波形", "wave"),
-            ("⌘", "自定义编程", "code"),
-            ("⚙", "设置", "settings"),
+            ("01", "总览", "dashboard"),
+            ("02", "游戏遥测", "telemetry"),
+            ("03", "电击规则", "rules"),
+            ("04", "事件日志", "logs"),
+            ("05", "连接 / 配对", "pair"),
+            ("06", "设备控制", "device"),
+            ("07", "自定义波形", "wave"),
+            ("08", "自定义编程", "code"),
+            ("09", "设置", "settings"),
         ]
 
         self.dashboard = QWidget()
@@ -5785,7 +5860,7 @@ class Window(QMainWindow):
         bl.addWidget(self.showvals); bl.addWidget(self.showbar); bl.addWidget(self.compact)
         form=QFormLayout(); self.dec=QSpinBox(); self.dec.setRange(0,2); self.dec.setValue(int(appearance["status_decimals"])); form.addRow("百分比小数位",self.dec); bl.addLayout(form)
         colors=QHBoxLayout(); cc=QPushButton("选择强调色"); cc.clicked.connect(self.choose_accent); colors.addWidget(cc)
-        for n,c in (("蓝","#5B8CFF"),("紫","#8B5CF6"),("青","#22D3EE"),("绿","#34D399"),("橙","#F59E0B")):
+        for n,c in (("紫","#645BC6"),("蓝","#3B71BC"),("樱","#B14378"),("青","#1E778C"),("绿","#247550")):
             bt=QPushButton(n); bt.clicked.connect(lambda checked=False,x=c:self.set_accent(x)); colors.addWidget(bt)
         bl.addLayout(colors)
         sv=QPushButton("保存外观设置"); sv.setObjectName("primary"); sv.clicked.connect(self.save_appearance); bl.addWidget(sv)
@@ -6024,7 +6099,7 @@ class Window(QMainWindow):
                 )
             )
             self.bepinex_status_label.setStyleSheet(
-                "color:#F5B84B;font-weight:700"
+                "color:#7C4800;font-weight:700"
             )
             return
 
@@ -6081,12 +6156,12 @@ class Window(QMainWindow):
 
             self.bepinex_status_label.setStyleSheet(
                 (
-                    "color:#46C58A;font-weight:700"
+                    "color:#155A3C;font-weight:700"
                     if status.get(
                         "coyote_plugin_installed",
                         False,
                     )
-                    else "color:#F5B84B;font-weight:700"
+                    else "color:#7C4800;font-weight:700"
                 )
             )
 
@@ -6117,7 +6192,7 @@ class Window(QMainWindow):
             )
 
             self.bepinex_status_label.setStyleSheet(
-                "color:#F5B84B;font-weight:700"
+                "color:#7C4800;font-weight:700"
             )
 
         else:
@@ -6132,7 +6207,7 @@ class Window(QMainWindow):
             )
 
             self.bepinex_status_label.setStyleSheet(
-                "color:#A7B3C6;font-weight:700"
+                "color:#4D566D;font-weight:700"
             )
 
     def set_bepinex_busy(
@@ -6893,7 +6968,7 @@ class Window(QMainWindow):
                 save_message,
             )
     def choose_accent(self):
-        c=QColorDialog.getColor(QColor(appearance.get("accent","#5B8CFF")),self,"选择强调色")
+        c=QColorDialog.getColor(QColor(appearance.get("accent","#645BC6")),self,"选择强调色")
         if c.isValid():self.set_accent(c.name())
     def set_accent(self,c):appearance["accent"]=c;self.apply_theme()
     def save_appearance(self):
@@ -7097,7 +7172,7 @@ class Window(QMainWindow):
                 "● "
                 + peak_base
             )
-            peak_color = "#46C58A"
+            peak_color = "#155A3C"
 
         elif (
             peak_state
@@ -7118,7 +7193,7 @@ class Window(QMainWindow):
                 "◐ "
                 + scene
             )
-            peak_color = "#F5B84B"
+            peak_color = "#7C4800"
 
         else:
             peak_base = I18N.tr(
@@ -7128,7 +7203,7 @@ class Window(QMainWindow):
                 "○ "
                 + peak_base
             )
-            peak_color = "#8FA0B8"
+            peak_color = "#4D566D"
 
         self.conn[
             "peak"
@@ -7683,8 +7758,19 @@ class Window(QMainWindow):
             if B.dg_ws:B.dg_ws.close()
         except:pass
         try:
-            if B.dg_process and B.dg_process.poll() is None:B.dg_process.terminate()
-        except:pass
+            process = B.dg_process
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        except Exception as exc:
+            B.add_log("错误", "Relay 停止失败", str(exc))
+        finally:
+            if B.dg_log is not None and not B.dg_log.closed:
+                B.dg_log.close()
         save_full_config();e.accept()
 
 
@@ -7697,7 +7783,6 @@ def main():
         "Coyote Qt Controller 启动",
         f"本机 IP={B.LAN_IP}",
     )
-    B.start_server()
     threading.Thread(
         target=B.websocket_loop,
         name="DGLAB-WebSocket",

@@ -2240,6 +2240,10 @@ def load_config():
         )
         return
 
+    if not isinstance(data, dict):
+        add_log("系统", "配置读取失败", "配置文件根节点必须是 JSON 对象")
+        return
+
     # -------------------- 网络端口 --------------------
     loaded_network = data.get("network")
     if isinstance(loaded_network, dict):
@@ -2755,7 +2759,7 @@ def pairing_url(controller_id=None):
 # 7. DG-LAB Server
 # ============================================================
 
-def server_running():
+def _server_port_open():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(0.25)
 
@@ -2765,13 +2769,34 @@ def server_running():
         s.close()
 
 
+def server_running():
+    """Only trust the local relay process started by this application."""
+    if dg_process is None or dg_process.poll() is not None:
+        return False
+    return _server_port_open()
+
+
 def start_server():
     global dg_process, dg_log
+
+    if stop_event.is_set():
+        return False
 
     if server_running():
         with dg_lock:
             dg["server"] = "服务器已运行"
         return True
+
+    if _server_port_open():
+        message = f"本机端口 {DG_PORT} 已被其他程序占用，无法启动内置 Relay"
+        with dg_lock:
+            dg["server"] = "启动失败"
+            dg["error"] = message
+        add_log("错误", "DG Server 启动失败", message)
+        return False
+
+    if dg_process is not None and dg_process.poll() is None:
+        return False
 
     if not BUN.exists() or not V4_SERVER.exists():
         with dg_lock:
@@ -2782,6 +2807,8 @@ def start_server():
         return False
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if dg_log is not None and not dg_log.closed:
+        dg_log.close()
     dg_log = open(SERVER_LOG_FILE, "a", encoding="utf-8")
 
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -2799,6 +2826,8 @@ def start_server():
             env=server_env,
         )
     except Exception as e:
+        dg_log.close()
+        dg_log = None
         with dg_lock:
             dg["server"] = "启动失败"
             dg["error"] = str(e)

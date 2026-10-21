@@ -16,7 +16,9 @@ intervals, but it cannot override those two local privacy switches.
 from __future__ import annotations
 
 import json
+import os
 import platform
+import tempfile
 import threading
 import time
 import uuid
@@ -41,8 +43,8 @@ _ORIGINAL_LOAD_CONFIG = None
 _ORIGINAL_SAVE_CONFIG = None
 
 REPORTING_DEFAULTS = {
-    "disable_log_upload": False,
-    "disable_state_upload": False,
+    "disable_log_upload": True,
+    "disable_state_upload": True,
     "client_instance_id": "",
 }
 
@@ -92,12 +94,22 @@ def _json_read(path: Path) -> dict:
 
 
 def _json_write(path: Path, data: dict) -> tuple[bool, str]:
+    temporary = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
         return True, "配置已保存"
     except Exception as exc:
         return False, str(exc)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _ensure_defaults() -> None:
@@ -113,8 +125,11 @@ def _load_config() -> None:
     section = data.get("reporting") or {}
     if not isinstance(section, dict):
         return
-    B.network_settings["disable_log_upload"] = bool(section.get("disable_log_upload", False))
-    B.network_settings["disable_state_upload"] = bool(section.get("disable_state_upload", False))
+    # Older versions saved opt-out defaults as false. Require a new, explicit
+    # consent marker before honoring those legacy values after an upgrade.
+    consent = section.get("diagnostics_consent") is True
+    B.network_settings["disable_log_upload"] = not consent or bool(section.get("disable_log_upload", True))
+    B.network_settings["disable_state_upload"] = not consent or bool(section.get("disable_state_upload", True))
     instance = _s(section.get("client_instance_id"))
     if instance:
         B.network_settings["client_instance_id"] = instance[:80]
@@ -124,8 +139,12 @@ def _save_config() -> tuple[bool, str]:
     _ensure_defaults()
     data = _json_read(B.CONFIG_FILE) if B.CONFIG_FILE.exists() else {}
     data["reporting"] = {
-        "disable_log_upload": bool(B.network_settings.get("disable_log_upload", False)),
-        "disable_state_upload": bool(B.network_settings.get("disable_state_upload", False)),
+        "diagnostics_consent": not (
+            bool(B.network_settings.get("disable_log_upload", True))
+            and bool(B.network_settings.get("disable_state_upload", True))
+        ),
+        "disable_log_upload": bool(B.network_settings.get("disable_log_upload", True)),
+        "disable_state_upload": bool(B.network_settings.get("disable_state_upload", True)),
         "client_instance_id": _s(B.network_settings.get("client_instance_id")) or uuid.uuid4().hex,
     }
     return _json_write(B.CONFIG_FILE, data)
@@ -210,8 +229,8 @@ def _send_json(payload: dict) -> bool:
 
 def _privacy() -> dict:
     return {
-        "logUploadDisabled": bool(B.network_settings.get("disable_log_upload", False)),
-        "stateUploadDisabled": bool(B.network_settings.get("disable_state_upload", False)),
+        "logUploadDisabled": bool(B.network_settings.get("disable_log_upload", True)),
+        "stateUploadDisabled": bool(B.network_settings.get("disable_state_upload", True)),
     }
 
 
@@ -318,7 +337,7 @@ def _state_payload() -> dict:
 
 def send_state(force=False) -> bool:
     global _LAST_STATE_SENT
-    if bool(B.network_settings.get("disable_state_upload", False)):
+    if bool(B.network_settings.get("disable_state_upload", True)):
         return False
     if not _is_encrypted_remote():
         return False
@@ -356,7 +375,7 @@ def _log_snapshot(max_items=100) -> tuple[int, list[dict]]:
 
 def send_logs(force=False, final=False, initial=False) -> bool:
     global _LAST_LOG_REVISION, _LAST_LOG_SENT
-    if bool(B.network_settings.get("disable_log_upload", False)):
+    if bool(B.network_settings.get("disable_log_upload", True)):
         return False
     if not _is_encrypted_remote():
         return False
@@ -774,19 +793,19 @@ def install_ui(UI) -> None:
             box = UI.QGroupBox("远程诊断与隐私")
             layout = UI.QVBoxLayout(box)
             note = UI.QLabel(
-                "仅在官方/自定义 WSS 中继下上传诊断数据；直连或 ws:// 不上传。"
-                "这两个本机隐私开关优先级高于服务器策略，不影响 DG-LAB 中转本身。"
+                "诊断上传默认关闭。勾选后，仅在官方或自定义 WSS 中继下上传；直连不上传。"
+                "这两个本机隐私选项优先于服务器策略，不影响 DG-LAB 中转本身。"
             )
             note.setObjectName("muted")
             note.setWordWrap(True)
             layout.addWidget(note)
 
-            self.disable_log_upload = UI.QCheckBox("禁止上传日志")
-            self.disable_log_upload.setChecked(bool(B.network_settings.get("disable_log_upload", False)))
-            self.disable_state_upload = UI.QCheckBox("禁止上传设备信息和游戏信息")
-            self.disable_state_upload.setChecked(bool(B.network_settings.get("disable_state_upload", False)))
-            layout.addWidget(self.disable_log_upload)
-            layout.addWidget(self.disable_state_upload)
+            self.allow_log_upload = UI.QCheckBox("允许上传诊断日志")
+            self.allow_log_upload.setChecked(not bool(B.network_settings.get("disable_log_upload", True)))
+            self.allow_state_upload = UI.QCheckBox("允许上传设备信息和游戏状态")
+            self.allow_state_upload.setChecked(not bool(B.network_settings.get("disable_state_upload", True)))
+            layout.addWidget(self.allow_log_upload)
+            layout.addWidget(self.allow_state_upload)
 
             info = UI.QFormLayout()
             self.remote_policy_label = UI.QLabel("-")
@@ -797,17 +816,31 @@ def install_ui(UI) -> None:
             info.addRow("远程诊断状态", self.remote_status_label)
             layout.addLayout(info)
 
-            self.disable_log_upload.toggled.connect(self._reporting_privacy_changed)
-            self.disable_state_upload.toggled.connect(self._reporting_privacy_changed)
+            self.allow_log_upload.toggled.connect(self._reporting_privacy_changed)
+            self.allow_state_upload.toggled.connect(self._reporting_privacy_changed)
 
             root = self.logs.layout()
             if root is not None:
                 root.insertWidget(0, box)
 
         def _reporting_privacy_changed(self, *_args):
-            B.network_settings["disable_log_upload"] = bool(self.disable_log_upload.isChecked())
-            B.network_settings["disable_state_upload"] = bool(self.disable_state_upload.isChecked())
-            _save_config()
+            previous_log = bool(B.network_settings.get("disable_log_upload", True))
+            previous_state = bool(B.network_settings.get("disable_state_upload", True))
+            B.network_settings["disable_log_upload"] = not self.allow_log_upload.isChecked()
+            B.network_settings["disable_state_upload"] = not self.allow_state_upload.isChecked()
+            ok, message = _save_config()
+            if not ok:
+                B.network_settings["disable_log_upload"] = previous_log
+                B.network_settings["disable_state_upload"] = previous_state
+                for control, checked in (
+                    (self.allow_log_upload, not previous_log),
+                    (self.allow_state_upload, not previous_state),
+                ):
+                    control.blockSignals(True)
+                    control.setChecked(checked)
+                    control.blockSignals(False)
+                self.msg_error("保存失败", "诊断上传设置没有写入配置。", message)
+                return
             send_privacy_update()
             if not B.network_settings["disable_state_upload"]:
                 send_state(force=True)

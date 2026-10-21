@@ -428,6 +428,8 @@ def install_backend():
                 data = json.loads(B.CONFIG_FILE.read_text(encoding="utf-8"))
             except Exception:
                 data = {}
+        if not isinstance(data, dict):
+            data = {}
         _normalize_extension_settings(data.get("extended_features", {}))
         loaded_rules = data.get("rules") if isinstance(data, dict) else None
 

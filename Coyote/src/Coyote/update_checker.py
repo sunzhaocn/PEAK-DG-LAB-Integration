@@ -13,6 +13,7 @@ the current installation, and then restarts Coyote.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -124,18 +125,7 @@ def _fetch_latest_release():
 
 def _asset_score(asset):
     name = str(asset.get("name") or "").lower()
-    if not name.endswith(".zip"):
-        return -1
-    score = 10
-    if "coyote" in name:
-        score += 20
-    if "windows" in name or "win" in name:
-        score += 20
-    if "x64" in name or "amd64" in name:
-        score += 10
-    if "source" in name or "src" in name:
-        score -= 30
-    return score
+    return 100 if name == "coyote_windows_x64_portable.zip" else -1
 
 
 def _select_update_asset(release):
@@ -250,10 +240,25 @@ def _download_and_stage(release):
                 out.write(chunk)
         if expected_size and downloaded != expected_size:
             raise RuntimeError(f"更新包下载不完整：应为 {expected_size} 字节，实际 {downloaded} 字节。")
+        digest = str(asset.get("digest") or "").strip().lower()
+        if digest:
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise RuntimeError("更新包的 SHA256 摘要格式无效。")
+            with zip_path.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            if actual != digest.split(":", 1)[1]:
+                raise RuntimeError("更新包的 SHA256 校验失败。")
         _safe_extract(zip_path, extracted)
         payload = _payload_root(extracted)
-        if not any(payload.iterdir()):
-            raise RuntimeError("更新包解压后没有可安装文件。")
+        required = (
+            "Coyote.exe",
+            "plugin/Coyote.dll",
+            "dglab-websocket-server-main/bun.exe",
+            "dglab-websocket-server-main/v4-server.ts",
+        )
+        missing = [name for name in required if not (payload / name).is_file()]
+        if missing:
+            raise RuntimeError("更新包缺少必要文件：" + ", ".join(missing))
         return {
             "temp_root": str(temp_root),
             "payload_root": str(payload),
@@ -287,16 +292,62 @@ def _write_update_helper(stage):
 $ErrorActionPreference = "Stop"
 try { Wait-Process -Id $PidToWait -ErrorAction SilentlyContinue } catch {}
 Start-Sleep -Milliseconds 700
-New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
-Get-ChildItem -LiteralPath $SourceDir -Force | ForEach-Object {
-    Copy-Item -LiteralPath $_.FullName -Destination $TargetDir -Recurse -Force
+if (-not (Test-Path -LiteralPath (Join-Path $TargetDir 'Coyote.exe'))) {
+    throw 'The existing portable installation is missing Coyote.exe.'
 }
-if (Test-Path -LiteralPath $RestartExe) {
-    if ([string]::IsNullOrWhiteSpace($RestartArg)) {
-        Start-Process -FilePath $RestartExe -WorkingDirectory $TargetDir
-    } else {
-        Start-Process -FilePath $RestartExe -ArgumentList @($RestartArg) -WorkingDirectory $TargetDir
+$parent = Split-Path -Parent $TargetDir
+$name = Split-Path -Leaf $TargetDir
+$nonce = [guid]::NewGuid().ToString('N')
+$next = Join-Path $parent ('.' + $name + '.next-' + $nonce)
+$backup = Join-Path $parent ('.' + $name + '.backup-' + $nonce)
+$swapped = $false
+try {
+    # Prepare a complete sibling directory before changing the live install.
+    # Copying the old directory first preserves settings, logs and user assets.
+    Copy-Item -LiteralPath $TargetDir -Destination $next -Recurse -Force
+    Get-ChildItem -LiteralPath $SourceDir -File -Recurse -Force | ForEach-Object {
+        $relative = $_.FullName.Substring($SourceDir.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $destination = Join-Path $next $relative
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+        Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
     }
+    foreach ($required in @('Coyote.exe', 'plugin\Coyote.dll',
+            'dglab-websocket-server-main\bun.exe',
+            'dglab-websocket-server-main\v4-server.ts')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $next $required))) {
+            throw "Staged update is missing $required"
+        }
+    }
+    Move-Item -LiteralPath $TargetDir -Destination $backup
+    try {
+        Move-Item -LiteralPath $next -Destination $TargetDir
+        $swapped = $true
+    } catch {
+        Move-Item -LiteralPath $backup -Destination $TargetDir
+        throw
+    }
+    if ([string]::IsNullOrWhiteSpace($RestartArg)) {
+        $restarted = Start-Process -FilePath $RestartExe -WorkingDirectory $TargetDir -PassThru
+    } else {
+        $restarted = Start-Process -FilePath $RestartExe -ArgumentList @($RestartArg) -WorkingDirectory $TargetDir -PassThru
+    }
+    Start-Sleep -Seconds 2
+    if ($restarted.HasExited) { throw 'Updated Coyote exited immediately after restart.' }
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    if ($swapped -and (Test-Path -LiteralPath $backup)) {
+        if (Test-Path -LiteralPath $TargetDir) {
+            Move-Item -LiteralPath $TargetDir -Destination $next
+        }
+        Move-Item -LiteralPath $backup -Destination $TargetDir
+        if (Test-Path -LiteralPath $next) { Remove-Item -LiteralPath $next -Recurse -Force }
+        if (Test-Path -LiteralPath $RestartExe) {
+            Start-Process -FilePath $RestartExe -WorkingDirectory $TargetDir
+        }
+    }
+    throw
+} finally {
+    if (Test-Path -LiteralPath $next) { Remove-Item -LiteralPath $next -Recurse -Force }
 }
 '''
     script.write_text(ps, encoding="utf-8-sig")
@@ -324,7 +375,8 @@ def _launch_installer(stage):
         str(restart_arg),
     ]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(command, close_fds=True, creationflags=creationflags)
+    subprocess.Popen(command, close_fds=True, creationflags=creationflags,
+                     cwd=str(Path(stage["temp_root"])))
 
 
 class _UpdateBridge(QObject):
@@ -502,7 +554,9 @@ def install_ui(UI):
                 B.add_log("系统", "准备安装更新", f"当前 v{APP_VERSION}")
             except Exception:
                 pass
-            QTimer.singleShot(350, UI.QApplication.instance().quit)
+            # Closing the window runs its shutdown path: stop and await Bun,
+            # release the server log handle, then let the helper swap folders.
+            QTimer.singleShot(350, self.close)
 
     UI.Window = UpdateAwareWindow
     UI.APP_VERSION = APP_VERSION

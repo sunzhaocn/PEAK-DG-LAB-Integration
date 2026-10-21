@@ -2,6 +2,14 @@
 
 This changelog records source/package-facing changes for the `Coyote/` project directory. Public desktop release versions are defined by `src/Coyote/app_version.py`; the BepInEx plugin assembly is independently versioned in `src/Coyote/Coyote.csproj`.
 
+## 0.0.6
+
+- Refreshed the Qt desktop UI with a light anime-inspired palette and clearer controls.
+- Hardened malformed configuration handling, network setting persistence and local relay ownership checks.
+- Limited plaintext direct pairing to trusted LAN/VPN addresses and made remote diagnostics opt-in.
+- Validated update assets and package contents before applying an update, with a rollback path for failed replacement.
+- Reduced the portable release to one ZIP containing only required runtime files and licenses; consolidated Python build dependencies in `requirements.txt`.
+
 ## Unreleased - source layout refactor
 
 - Added `src/Coyote/coyote_app/` as the canonical desktop application package.

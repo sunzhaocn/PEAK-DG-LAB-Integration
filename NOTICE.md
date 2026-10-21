@@ -19,3 +19,5 @@ Within Coyote, **“official relay” / `official_relay` means the relay endpoin
 ## External build/runtime components
 
 The project also interoperates with PEAK, BepInEx, ThunderPipe/Thunderstore tooling, Bun, Qt/PySide6 and other third-party components. Their trademarks, binaries and licenses remain governed by their respective owners and terms.
+
+The Windows portable archive includes Bun 1.3.14. Its upstream license and linked-component notices are included as `BUN-LICENSE.md` in the same archive.

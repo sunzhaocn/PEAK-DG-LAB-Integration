@@ -117,7 +117,7 @@ Write-Host "      Coyote.dll build completed." -ForegroundColor Green
 # -----------------------------------------------------------------------------
 Write-Host "[4/9] Installing Python dependencies..." -ForegroundColor Yellow
 Invoke-Native $Python "-m" "pip" "install" "--upgrade" "pip"
-Invoke-Native $Python "-m" "pip" "install" "PySide6" "Pillow" "qrcode" "websocket-client" "pyinstaller>=6.15" "pyinstaller-hooks-contrib"
+Invoke-Native $Python "-m" "pip" "install" "-r" (Join-Path $Root "requirements.txt")
 
 Write-Host "      Compiling Python sources..." -ForegroundColor Yellow
 $PythonSources = @()
@@ -201,11 +201,18 @@ if (-not (Test-Path -LiteralPath $Exe)) { throw "Coyote.exe was not generated." 
 # 8. Copy editable/runtime resources and the freshly built plugin
 # -----------------------------------------------------------------------------
 Write-Host "[8/9] Copying runtime resources..." -ForegroundColor Yellow
-Copy-DirIfExists (Join-Path $Root "dglab-websocket-server-main") (Join-Path $AppDir "dglab-websocket-server-main")
+$RelayRuntime = Join-Path $AppDir "dglab-websocket-server-main"
+New-Item -ItemType Directory -Force -Path $RelayRuntime | Out-Null
+foreach ($name in @("bun.exe", "v4-server.ts", "LICENSE")) {
+    Copy-Item -LiteralPath (Join-Path $Root "dglab-websocket-server-main\$name") -Destination (Join-Path $RelayRuntime $name) -Force
+}
 Copy-DirIfExists (Join-Path $Root "assets") (Join-Path $AppDir "assets")
 Copy-DirIfExists (Join-Path $Root "src\Coyote\language") (Join-Path $AppDir "src\Coyote\language")
 Copy-DirIfExists (Join-Path $Root "src\Coyote\md") (Join-Path $AppDir "src\Coyote\md")
 Copy-DirIfExists (Join-Path $Root "docs") (Join-Path $AppDir "docs")
+Copy-Item -LiteralPath (Join-Path $Root "LICENSE") -Destination (Join-Path $AppDir "LICENSE") -Force
+Copy-Item -LiteralPath (Join-Path $Root "BUN-LICENSE.md") -Destination (Join-Path $AppDir "BUN-LICENSE.md") -Force
+Copy-Item -LiteralPath (Join-Path (Split-Path $Root -Parent) "NOTICE.md") -Destination (Join-Path $AppDir "NOTICE.md") -Force
 
 $RelayIdentity = Join-Path $Root "src\Coyote\official_relay.json"
 if (Test-Path -LiteralPath $RelayIdentity) {
@@ -238,6 +245,15 @@ $ReleaseZip = Join-Path $ReleaseDir "Coyote_Windows_x64_Portable.zip"
 if (Test-Path -LiteralPath $ReleaseZip) { Remove-Item $ReleaseZip -Force }
 Compress-Archive -Path (Join-Path $AppDir "*") -DestinationPath $ReleaseZip -CompressionLevel Optimal
 if (-not (Test-Path -LiteralPath $ReleaseZip)) { throw "Portable ZIP was not generated." }
+
+$Forbidden = Get-ChildItem -LiteralPath $AppDir -Recurse -Force -File | Where-Object {
+    $relative = $_.FullName.Substring($AppDir.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $relative -match '(^|[\\/])(tests|node_modules|__pycache__)([\\/]|$)' -or
+    $relative -match '(?i)(^|[\\/])[^\\/]+\.lock$'
+}
+if ($Forbidden) {
+    throw "Development files found in portable package: $($Forbidden.FullName -join ', ')"
+}
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Green

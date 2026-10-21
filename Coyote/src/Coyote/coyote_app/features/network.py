@@ -5,9 +5,8 @@ The UI and networking model intentionally expose only three top-level modes:
 1. Direct (default)
    - Coyote controller -> local Bun relay (127.0.0.1)
    - phone -> a phone-reachable address of this PC
-   - ordinary LAN, Tailscale/ZeroTier/WireGuard/VPN, public IPv4/IPv6 and a
-     manually routable hostname are all just different *address sources* of the
-     same direct topology.
+   - trusted LAN or VPN addresses only. Public access requires a WSS relay;
+     the direct pairing URL contains a bearer ID and uses plaintext ws://.
 2. Official WSS relay
    - fixed release endpoint from official_relay.json / relay_config.py.
 3. Custom relay
@@ -26,8 +25,11 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
+import re
 import socket
 import ssl
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -103,12 +105,22 @@ def _json_read(path: Path) -> dict:
 
 
 def _json_write(path: Path, data: dict) -> tuple[bool, str]:
+    temporary = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
         return True, "配置已保存"
     except Exception as exc:
         return False, str(exc)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def normalize_relay_url(value) -> tuple[bool, str]:
@@ -194,6 +206,22 @@ def _host_for_url(host: str) -> str:
         return host
 
 
+def _trusted_direct_host(host: str) -> bool:
+    """Direct pairing uses plaintext ws://, so never advertise public hosts."""
+    host = _clean_host_input(host).strip().lower()
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+        return not (address.is_global or address.is_multicast or address.is_unspecified)
+    except ValueError:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*[a-z0-9]|[a-z0-9]", host):
+            return False
+        if ".." in host:
+            return False
+        return "." not in host or host.endswith((".local", ".lan", ".home.arpa", ".ts.net"))
+
+
 def _mode() -> str:
     raw = _s(B.network_settings.get("connection_mode", MODE_DIRECT))
     mode = LEGACY_MODE_MAP.get(raw, raw)
@@ -260,9 +288,10 @@ def phone_ws_url(controller_id=None):
         base = active_controller_url().rstrip("/")
         return f"{base}?tid={quote(str(controller_id), safe='')}"
 
-    host = _host_for_url(_best_direct_host())
-    if not host:
+    selected_host = _best_direct_host()
+    if not _trusted_direct_host(selected_host):
         return None
+    host = _host_for_url(selected_host)
     return f"ws://{host}:{_direct_port()}/?tid={quote(str(controller_id), safe='')}"
 
 
@@ -734,11 +763,13 @@ def install_ui(UI) -> None:
             direct_form.addRow("手机地址来源", self.net_host_source)
             self._manual_host_label = UI.QLabel("手动地址")
             direct_form.addRow(self._manual_host_label, self.net_manual_host)
-            direct_form.addRow("手机访问端口", self.net_direct_port)
+            direct_form.addRow("手机访问端口（映射）", self.net_direct_port)
+            self.net_direct_port.setToolTip("无端口转发时，应与本机 DG-LAB V4 监听端口相同。")
             direct_l.addLayout(direct_form)
             direct_l.addWidget(self._note(
-                "直连是默认模式。普通 Wi-Fi/LAN、Tailscale、ZeroTier、WireGuard、VPN、"
-                "公网 IPv4/IPv6 都属于同一拓扑，只是手机访问本机 Relay 时使用的地址不同。"
+                f"直连仅用于可信局域网或 VPN。控制器在本机端口 {B.DG_PORT} 监听；"
+                "这里的端口只写入手机配对地址。两者不同时，须将手机访问端口转发到本机监听端口。"
+                "公网连接请使用加密的 WSS 中继。"
             ))
             direct_l.addStretch(1)
             self.net_tabs.addTab(direct_tab, "直连")
@@ -760,7 +791,7 @@ def install_ui(UI) -> None:
             official_l.addLayout(official_form)
             official_l.addWidget(self._note(
                 "只有你主动选择并点击“应用并重连”后才走北京官方中继。"
-                "程序不会因为直连失败而自动切到公网。"
+                "程序不会因为直连失败而自动切到公网。诊断日志和状态默认不上传，可在日志页主动开启。"
             ))
             official_l.addStretch(1)
             self.net_tabs.addTab(official_tab, "官方中继")
@@ -781,7 +812,8 @@ def install_ui(UI) -> None:
             custom_form.addRow("Relay 地址", self.net_custom)
             custom_l.addLayout(custom_form)
             custom_l.addWidget(self._note(
-                "填写用户自己搭建的 wss:// Relay。公网中继不允许明文 ws://；局域网/虚拟组网请使用“直连”。"
+                "填写自己搭建的 wss:// Relay。公网中继不允许明文 ws://；可信局域网或 VPN 请使用“直连”。"
+                "诊断日志和状态默认不上传，可在日志页主动开启。"
             ))
             custom_l.addStretch(1)
             self.net_tabs.addTab(custom_tab, "自定义中继")
@@ -904,9 +936,10 @@ def install_ui(UI) -> None:
             return local4 or local6 or _s(getattr(B, "LAN_IP", "")) or "127.0.0.1"
 
         def _direct_preview_phone_url(self) -> str:
-            host = _host_for_url(self._direct_selected_host())
-            if not host:
-                return "未检测到可用地址"
+            selected_host = self._direct_selected_host()
+            if not _trusted_direct_host(selected_host):
+                return "仅支持可信局域网或 VPN 地址；公网请使用 WSS 中继"
+            host = _host_for_url(selected_host)
             return f"ws://{host}:{int(self.net_direct_port.value())}/?tid=<控制方ID>"
 
         def _selected_relay_url(self) -> tuple[bool, str]:
@@ -953,11 +986,15 @@ def install_ui(UI) -> None:
                     host = _clean_host_input(manual)
                     if not host:
                         return False, "手动地址模式必须填写手机能够访问到的本机 IP、IPv6 或域名。"
+                    if not _trusted_direct_host(host):
+                        return False, "直连只支持可信局域网或 VPN 地址。公网请使用 WSS 中继。"
                     manual = host
                 elif source == HOST_IPV4 and not network_snapshot().get("local_ipv4"):
                     return False, "当前没有检测到可用的本机 IPv4。"
                 elif source == HOST_IPV6 and not network_snapshot().get("local_ipv6"):
                     return False, "当前没有检测到可用的本机 IPv6。"
+                elif not _trusted_direct_host(self._direct_selected_host()):
+                    return False, "当前地址不是可信局域网或 VPN 地址。公网请使用 WSS 中继。"
 
             B.network_settings["connection_mode"] = mode
             B.network_settings["custom_relay_url"] = custom
@@ -967,12 +1004,15 @@ def install_ui(UI) -> None:
             return True, ""
 
         def network_apply(self):
+            previous = dict(B.network_settings)
             ok, message = self._network_collect()
             if not ok:
                 self.msg_warning("网络设置无效", message, "请检查当前选项卡中的地址设置。")
                 return
             ok, message = _persist_network_only()
             if not ok:
+                B.network_settings.clear()
+                B.network_settings.update(previous)
                 self.msg_error("保存失败", "网络设置没有写入配置。", message)
                 return
             request_reconnect("用户应用网络设置")
@@ -982,9 +1022,16 @@ def install_ui(UI) -> None:
 
         def network_restore_official(self):
             name, url = official_name_url()
+            previous = dict(B.network_settings)
             B.network_settings["connection_mode"] = MODE_OFFICIAL
             self._set_tab_for_mode(MODE_OFFICIAL)
-            _persist_network_only()
+            ok, message = _persist_network_only()
+            if not ok:
+                B.network_settings.clear()
+                B.network_settings.update(previous)
+                self._set_tab_for_mode(_mode())
+                self.msg_error("保存失败", "网络设置没有写入配置。", message)
+                return
             request_reconnect("用户切换到官方中继")
             self.feedback(f"已切换{name}：{url}", 3000)
             self._refresh_network_panel(force=True)
